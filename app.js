@@ -1,6 +1,6 @@
-const GEMINI_MODEL = 'gemini-2.0-flash';
-const GEMINI_API_BASE = 'https://generativelanguage.googleapis.com/v1beta/models';
-const GEMINI_API_KEY = (self.FYX_LOCAL_CONFIG && self.FYX_LOCAL_CONFIG.GEMINI_API_KEY) || '';
+// FYX Focus App — Integrated with background service worker
+// Camera analysis runs through offscreen → background pipeline
+// Session state shared with popup and dashboard
 
 const ui = {
   goal: document.getElementById('goal'),
@@ -20,14 +20,8 @@ const state = {
   stream: null,
   startTs: 0,
   focusScore: 100,
-  faceDetector: null,
-  prevCenter: null,
-  noFaceFrames: 0,
-  focusHistory: [],
-  movementHistory: [],
-  sampleTimer: null,
   tickTimer: null,
-  agentTimer: null,
+  landmarkPollTimer: null,
   goal: ''
 };
 
@@ -37,19 +31,79 @@ function init() {
 
   ui.startBtn.addEventListener('click', startSession);
   ui.stopBtn.addEventListener('click', stopSession);
+
+  // Restore session if one is already active in background
+  restoreSession();
+
+  // Listen for live messages from background
+  chrome.runtime.onMessage.addListener((message) => {
+    if (message.type === 'GEMINI_REASONING') {
+      addLog(message.entry.message || message.entry.reason || '');
+    }
+
+    if (message.type === 'ATTENTION_UPDATE') {
+      state.focusScore = message.score;
+      ui.focusScore.textContent = String(Math.round(message.score));
+    }
+
+    if (message.type === 'SESSION_ENDED') {
+      handleSessionEnded();
+    }
+
+    if (message.type === 'SESSION_STARTED') {
+      if (!state.running) {
+        state.running = true;
+        state.startTs = message.startTime || Date.now();
+        state.goal = message.goal || '';
+        ui.startBtn.disabled = true;
+        ui.stopBtn.disabled = false;
+        ui.faceState.textContent = 'Tracking';
+        updateClock();
+        state.tickTimer = setInterval(updateClock, 1000);
+        setAgentStatus('Session started from another page.', 'normal');
+      }
+    }
+  });
 }
 
-async function startSession() {
-  const goal = ui.goal.value.trim() || 'Stay focused on the active task';
+async function restoreSession() {
+  try {
+    const sessionState = await chrome.runtime.sendMessage({ type: 'GET_SESSION_STATE' });
+    if (sessionState && sessionState.active) {
+      state.running = true;
+      state.startTs = sessionState.startTime;
+      state.focusScore = sessionState.attentionScore || 100;
+      state.goal = sessionState.goal || '';
 
-  if (!GEMINI_API_KEY || GEMINI_API_KEY === 'PASTE_NEW_GEMINI_KEY_HERE') {
-    setAgentStatus('Set GEMINI_API_KEY in local-config.js before starting.', 'danger');
-    return;
+      ui.goal.value = state.goal;
+      ui.startBtn.disabled = true;
+      ui.stopBtn.disabled = false;
+      ui.focusScore.textContent = String(Math.round(state.focusScore));
+      ui.faceState.textContent = 'Tracking';
+
+      updateClock();
+      state.tickTimer = setInterval(updateClock, 1000);
+
+      // Start polling landmark data for face state display
+      startLandmarkPolling();
+
+      // Render existing reasoning log
+      const log = sessionState.geminiReasoningLog || [];
+      for (const entry of log.slice(-8)) {
+        addLog(entry.message || entry.reason || '');
+      }
+
+      setAgentStatus('Session restored. Monitoring active.', 'normal');
+
+      // Start local video preview
+      await startVideoPreview();
+    }
+  } catch {
+    // Background not ready
   }
+}
 
-  state.goal = goal;
-  localStorage.setItem('fyx_goal', goal);
-
+async function startVideoPreview() {
   try {
     state.stream = await navigator.mediaDevices.getUserMedia({
       video: { width: { ideal: 640 }, height: { ideal: 480 }, frameRate: { ideal: 15, max: 20 } },
@@ -57,250 +111,152 @@ async function startSession() {
     });
     ui.video.srcObject = state.stream;
     await ui.video.play();
-  } catch (error) {
-    setAgentStatus('Camera permission denied. Webcam is required for focus tracking.', 'danger');
-    return;
+  } catch {
+    // Camera may already be in use by offscreen document, that's OK
+    ui.faceState.textContent = 'Camera in use by background';
+    ui.faceState.className = 'metric-value small status-warn';
   }
+}
 
-  state.faceDetector = 'FaceDetector' in window
-    ? new FaceDetector({ fastMode: true, maxDetectedFaces: 1 })
-    : null;
-
-  if (!state.faceDetector) {
-    setAgentStatus('FaceDetector API not supported. Use latest Chrome for standalone mode.', 'danger');
+function stopVideoPreview() {
+  if (state.stream) {
     state.stream.getTracks().forEach((track) => track.stop());
     state.stream = null;
-    ui.video.srcObject = null;
-    return;
   }
+  ui.video.srcObject = null;
+  const ctx = ui.overlay.getContext('2d');
+  ctx.clearRect(0, 0, ui.overlay.width, ui.overlay.height);
+}
 
-  state.running = true;
-  state.startTs = Date.now();
-  state.focusScore = 100;
-  state.prevCenter = null;
-  state.noFaceFrames = 0;
-  state.focusHistory = [];
-  state.movementHistory = [];
+async function startSession() {
+  const goal = ui.goal.value.trim() || 'Stay focused on the active task';
 
-  ui.startBtn.disabled = true;
-  ui.stopBtn.disabled = false;
-  ui.focusScore.textContent = '100';
-  ui.faceState.textContent = 'Tracking';
+  state.goal = goal;
+  localStorage.setItem('fyx_goal', goal);
 
-  state.sampleTimer = setInterval(sampleCamera, 700);
-  state.tickTimer = setInterval(updateClock, 1000);
-  state.agentTimer = setInterval(runAgentLoop, 30000);
+  setAgentStatus('Starting session...', 'normal');
 
-  setAgentStatus('Gemini agent running. Monitoring focus signals.', 'normal');
-  addLog('Session started. Agent will check every 30s.');
+  try {
+    // Tell background to start the focus session
+    await chrome.runtime.sendMessage({
+      type: 'START_FOCUS_SESSION',
+      duration: 25,
+      goal
+    });
 
-  runAgentLoop();
+    state.running = true;
+    state.startTs = Date.now();
+    state.focusScore = 100;
+
+    ui.startBtn.disabled = true;
+    ui.stopBtn.disabled = false;
+    ui.focusScore.textContent = '100';
+    ui.faceState.textContent = 'Tracking';
+
+    state.tickTimer = setInterval(updateClock, 1000);
+    updateClock();
+
+    // Start polling landmark data
+    startLandmarkPolling();
+
+    // Start local video preview
+    await startVideoPreview();
+
+    setAgentStatus('Session active. Camera analysis running via background.', 'normal');
+    addLog('Session started. Background monitoring active.');
+  } catch (error) {
+    setAgentStatus('Failed to start session: ' + error.message, 'danger');
+  }
 }
 
 async function stopSession() {
   if (!state.running) return;
 
-  state.running = false;
-  clearInterval(state.sampleTimer);
-  clearInterval(state.tickTimer);
-  clearInterval(state.agentTimer);
-
-  if (state.stream) {
-    state.stream.getTracks().forEach((track) => track.stop());
-    state.stream = null;
+  try {
+    await chrome.runtime.sendMessage({ type: 'STOP_SESSION' });
+  } catch {
+    // Background may not respond
   }
 
-  ui.video.srcObject = null;
-  const ctx = ui.overlay.getContext('2d');
-  ctx.clearRect(0, 0, ui.overlay.width, ui.overlay.height);
+  handleSessionEnded();
+}
+
+function handleSessionEnded() {
+  state.running = false;
+  clearInterval(state.tickTimer);
+  stopLandmarkPolling();
+  stopVideoPreview();
 
   ui.startBtn.disabled = false;
   ui.stopBtn.disabled = true;
   ui.faceState.textContent = 'Idle';
 
-  const summary = summarizeFocus();
-  addLog(`Session ended. Avg score ${summary.average}, away frames ${summary.awayFrames}.`);
+  addLog('Session ended.');
   setAgentStatus('Session stopped.', 'normal');
 }
 
 function updateClock() {
+  if (!state.startTs) return;
   const elapsed = Math.floor((Date.now() - state.startTs) / 1000);
   const mm = String(Math.floor(elapsed / 60)).padStart(2, '0');
   const ss = String(elapsed % 60).padStart(2, '0');
   ui.sessionTime.textContent = `${mm}:${ss}`;
 }
 
-async function sampleCamera() {
-  if (!state.running || !state.faceDetector) return;
+// Poll background for latest landmark/face data to update UI
+function startLandmarkPolling() {
+  stopLandmarkPolling();
+  state.landmarkPollTimer = setInterval(pollLandmarkData, 1500);
+  pollLandmarkData();
+}
 
-  ensureCanvasSize();
-  const ctx = ui.overlay.getContext('2d');
-  ctx.clearRect(0, 0, ui.overlay.width, ui.overlay.height);
-
-  try {
-    const faces = await state.faceDetector.detect(ui.video);
-
-    if (!faces.length) {
-      state.noFaceFrames += 1;
-      updateScore(-3);
-      ui.faceState.textContent = 'Face not found';
-      ui.faceState.className = 'metric-value small status-danger';
-      recordMetrics(0);
-      return;
-    }
-
-    const face = faces[0].boundingBox;
-    const center = { x: face.x + face.width / 2, y: face.y + face.height / 2 };
-
-    ctx.strokeStyle = '#2dd4bf';
-    ctx.lineWidth = 2;
-    ctx.strokeRect(face.x, face.y, face.width, face.height);
-
-    let movement = 0;
-    if (state.prevCenter) {
-      const dx = center.x - state.prevCenter.x;
-      const dy = center.y - state.prevCenter.y;
-      const distance = Math.sqrt(dx * dx + dy * dy);
-      const diagonal = Math.sqrt(ui.overlay.width ** 2 + ui.overlay.height ** 2);
-      movement = distance / diagonal;
-    }
-
-    state.prevCenter = center;
-
-    if (movement > 0.06) {
-      updateScore(-4);
-      ui.faceState.textContent = 'High movement';
-      ui.faceState.className = 'metric-value small status-warn';
-    } else if (movement > 0.03) {
-      updateScore(-1);
-      ui.faceState.textContent = 'Moving';
-      ui.faceState.className = 'metric-value small';
-    } else {
-      updateScore(1);
-      ui.faceState.textContent = 'Stable';
-      ui.faceState.className = 'metric-value small';
-    }
-
-    recordMetrics(movement);
-  } catch (error) {
-    setAgentStatus('Face detection failed in this browser. Use latest Chrome.', 'danger');
-    stopSession();
+function stopLandmarkPolling() {
+  if (state.landmarkPollTimer) {
+    clearInterval(state.landmarkPollTimer);
+    state.landmarkPollTimer = null;
   }
 }
 
-function updateScore(delta) {
-  state.focusScore = Math.max(0, Math.min(100, state.focusScore + delta));
-  ui.focusScore.textContent = String(state.focusScore);
-}
-
-function recordMetrics(movement) {
-  state.focusHistory.push(state.focusScore);
-  state.movementHistory.push(movement);
-
-  if (state.focusHistory.length > 120) state.focusHistory.shift();
-  if (state.movementHistory.length > 120) state.movementHistory.shift();
-}
-
-function summarizeFocus() {
-  const count = state.focusHistory.length || 1;
-  const average = Math.round(state.focusHistory.reduce((a, b) => a + b, 0) / count);
-  return {
-    average,
-    awayFrames: state.noFaceFrames
-  };
-}
-
-async function runAgentLoop() {
+async function pollLandmarkData() {
   if (!state.running) return;
 
-  const avgScore = state.focusHistory.length
-    ? Math.round(state.focusHistory.reduce((a, b) => a + b, 0) / state.focusHistory.length)
-    : state.focusScore;
-
-  const avgMovement = state.movementHistory.length
-    ? Number((state.movementHistory.reduce((a, b) => a + b, 0) / state.movementHistory.length).toFixed(3))
-    : 0;
-
-  const payload = {
-    goal: state.goal,
-    score_now: state.focusScore,
-    score_avg: avgScore,
-    avg_face_movement: avgMovement,
-    no_face_events: state.noFaceFrames,
-    elapsed_min: Math.max(1, Math.round((Date.now() - state.startTs) / 60000))
-  };
-
-  const prompt = `You are FYX Agent, a focus coach that decides the next best action.
-
-State:
-${JSON.stringify(payload, null, 2)}
-
-Return strict JSON:
-{
-  "status": "on_track" | "drifting" | "distracted",
-  "coach_message": "one short message",
-  "next_action": "continue" | "micro_break" | "recenter" | "hydrate",
-  "reason": "one short reason"
-}`;
-
   try {
-    const text = await callGemini(prompt);
-    const decision = parseJson(text);
-    if (!decision) {
-      addLog('Agent: unable to parse response, continuing session.');
+    const data = await chrome.runtime.sendMessage({ type: 'GET_LANDMARK_DATA' });
+    if (!data || !data.success) return;
+
+    const lm = data.landmarks;
+    const camState = data.cameraUserState || 'unknown';
+
+    if (!lm || !lm.facePresent) {
+      ui.faceState.textContent = 'Face not found';
+      ui.faceState.className = 'metric-value small status-danger';
       return;
     }
 
-    const msg = `${decision.coach_message} (${decision.next_action})`;
-    addLog(msg);
-
-    if (decision.status === 'distracted') {
-      setAgentStatus(`Attention dropped: ${decision.reason}`, 'danger');
-    } else if (decision.status === 'drifting') {
-      setAgentStatus(`Attention drifting: ${decision.reason}`, 'warn');
+    if (lm.eyesClosed) {
+      ui.faceState.textContent = 'Eyes closing';
+      ui.faceState.className = 'metric-value small status-danger';
+    } else if (lm.lookingAway) {
+      const yaw = lm.headPose ? lm.headPose.yaw : 0;
+      ui.faceState.textContent = `Looking away (yaw: ${Math.round(yaw)})`;
+      ui.faceState.className = 'metric-value small status-warn';
+    } else if (camState === 'bored') {
+      ui.faceState.textContent = 'Drowsy';
+      ui.faceState.className = 'metric-value small status-warn';
     } else {
-      setAgentStatus('On track. Keep going.', 'normal');
+      const ear = lm.avgEAR ? lm.avgEAR.toFixed(2) : '--';
+      ui.faceState.textContent = `Focused (EAR: ${ear})`;
+      ui.faceState.className = 'metric-value small';
     }
-  } catch (error) {
-    addLog('Agent call failed. Check API key/network and continue local tracking.');
-  }
-}
 
-async function callGemini(prompt) {
-  const url = `${GEMINI_API_BASE}/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      contents: [{ parts: [{ text: prompt }] }],
-      generationConfig: {
-        temperature: 0.5,
-        maxOutputTokens: 220,
-        responseMimeType: 'application/json'
-      }
-    })
-  });
-
-  if (!response.ok) {
-    throw new Error(`Gemini HTTP ${response.status}`);
-  }
-
-  const data = await response.json();
-  return data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
-}
-
-function parseJson(text) {
-  if (!text) return null;
-  try {
-    return JSON.parse(text);
+    // Update focus score from background
+    const scoreResp = await chrome.runtime.sendMessage({ type: 'GET_ATTENTION_SCORE' });
+    if (scoreResp && typeof scoreResp.score === 'number') {
+      state.focusScore = scoreResp.score;
+      ui.focusScore.textContent = String(Math.round(scoreResp.score));
+    }
   } catch {
-    const match = text.match(/\{[\s\S]*\}/);
-    if (!match) return null;
-    try {
-      return JSON.parse(match[0]);
-    } catch {
-      return null;
-    }
+    // Background not ready
   }
 }
 
@@ -316,15 +272,9 @@ function addLog(text) {
   const ts = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
   item.textContent = `${ts} - ${text}`;
   ui.agentLog.prepend(item);
-  if (ui.agentLog.children.length > 8) {
+  if (ui.agentLog.children.length > 12) {
     ui.agentLog.removeChild(ui.agentLog.lastChild);
   }
-}
-
-function ensureCanvasSize() {
-  const rect = ui.video.getBoundingClientRect();
-  ui.overlay.width = Math.round(rect.width);
-  ui.overlay.height = Math.round(rect.height);
 }
 
 init();

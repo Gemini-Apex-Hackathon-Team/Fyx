@@ -31,8 +31,8 @@
     <!-- Greeting -->
     <div class="fyx-greeting" id="greeting">Hey there!</div>
 
-    <!-- Attention Score Display -->
-    <div class="fyx-score-section">
+    <!-- Attention Score Display (hidden when no session active) -->
+    <div class="fyx-score-section" id="score-section" style="display: none;">
       <div class="fyx-score-circle">
         <svg width="130" height="130" viewBox="0 0 130 130">
           <circle cx="65" cy="65" r="52" class="fyx-score-bg"></circle>
@@ -66,8 +66,16 @@
     <!-- Session Timer -->
     <div class="fyx-session-info" id="session-info" style="display: none;">
       <div class="fyx-timer" id="session-timer">25:00</div>
-      <div class="fyx-timer-label">Focus Session</div>
+      <div class="fyx-timer-label" id="session-goal-label">Focus Session</div>
       <button class="fyx-action-btn fyx-btn-small" id="stop-session">Stop Session</button>
+    </div>
+
+    <!-- Gemini Reasoning Feed (always visible) -->
+    <div class="fyx-reasoning-feed" id="reasoning-feed" style="margin: 0 24px 16px; position: relative; z-index: 1;">
+      <h4>Gemini Thinking</h4>
+      <ul id="reasoning-list">
+        <li class="type-observation"><span class="reasoning-time">--</span> Start a session to see Gemini's reasoning</li>
+      </ul>
     </div>
 
     <!-- Statistics -->
@@ -131,6 +139,14 @@
             <option value="30">Every 30 min</option>
           </select>
         </label>
+      </div>
+
+      <div class="fyx-setting-item">
+        <label>
+          <span>Gemini API Key</span>
+          <input type="password" id="gemini-api-key" placeholder="Enter your Gemini API key" style="width: 100%; padding: 6px 8px; border-radius: 6px; border: 1px solid var(--fyx-border); background: var(--fyx-surface); color: var(--fyx-text); font-size: 12px; margin-top: 4px;">
+        </label>
+        <div id="api-key-status" style="font-size: 11px; color: rgba(255,255,255,0.4); margin-top: 2px;"></div>
       </div>
     </div>
 

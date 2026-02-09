@@ -1,11 +1,18 @@
 // FYX Dashboard JavaScript
 
+let dashSessionActive = false;
+let dashSessionStartTime = null;
+let dashSessionDuration = 25 * 60; // seconds
+let dashTimerInterval = null;
+
 document.addEventListener('DOMContentLoaded', async () => {
   document.getElementById('current-date').textContent = new Date().toLocaleDateString('en-US', {
     weekday: 'long', year: 'numeric', month: 'long', day: 'numeric'
   });
 
   await loadDashboardData();
+  await restoreSessionState();
+  setupSessionControls();
 
   document.getElementById('refresh-insights').addEventListener('click', async () => {
     const btn = document.getElementById('refresh-insights');
@@ -22,12 +29,160 @@ document.addEventListener('DOMContentLoaded', async () => {
   });
 });
 
+// Restore session from background
+async function restoreSessionState() {
+  try {
+    const state = await chrome.runtime.sendMessage({ type: 'GET_SESSION_STATE' });
+    if (state && state.active) {
+      showActiveSession(state.startTime, state.goal, state.duration);
+    }
+    // Always load reasoning log (shows history even when no session active)
+    if (state && state.geminiReasoningLog && state.geminiReasoningLog.length > 0) {
+      renderReasoningLog(state.geminiReasoningLog);
+    }
+  } catch {
+    // Background not ready — try loading from storage
+    try {
+      const stored = await chrome.storage.local.get(['geminiReasoningLog']);
+      if (stored.geminiReasoningLog && stored.geminiReasoningLog.length > 0) {
+        renderReasoningLog(stored.geminiReasoningLog);
+      }
+    } catch {
+      // ignore
+    }
+  }
+}
+
+function showActiveSession(startTime, goal, duration) {
+  dashSessionActive = true;
+  dashSessionStartTime = startTime;
+  dashSessionDuration = (duration || 25 * 60 * 1000) / 1000;
+
+  document.getElementById('session-idle').style.display = 'none';
+  document.getElementById('session-active').style.display = 'block';
+
+  const badge = document.getElementById('live-badge');
+  badge.className = 'live-badge';
+  document.getElementById('live-badge-text').textContent = 'Active';
+
+  if (goal) {
+    document.getElementById('dash-goal-display').textContent = goal;
+  }
+
+  updateDashTimer();
+  dashTimerInterval = setInterval(updateDashTimer, 1000);
+}
+
+function showIdleSession() {
+  dashSessionActive = false;
+  dashSessionStartTime = null;
+
+  if (dashTimerInterval) {
+    clearInterval(dashTimerInterval);
+    dashTimerInterval = null;
+  }
+
+  document.getElementById('session-idle').style.display = 'block';
+  document.getElementById('session-active').style.display = 'none';
+
+  const badge = document.getElementById('live-badge');
+  badge.className = 'live-badge inactive';
+  document.getElementById('live-badge-text').textContent = 'No Session';
+}
+
+function updateDashTimer() {
+  if (!dashSessionStartTime) return;
+
+  const elapsed = Math.floor((Date.now() - dashSessionStartTime) / 1000);
+  const remaining = Math.max(0, dashSessionDuration - elapsed);
+
+  const minutes = Math.floor(remaining / 60);
+  const seconds = remaining % 60;
+
+  document.getElementById('dash-timer').textContent =
+    `${minutes}:${seconds.toString().padStart(2, '0')}`;
+
+  if (remaining === 0) {
+    showIdleSession();
+  }
+}
+
+function setupSessionControls() {
+  document.getElementById('dash-start-btn').addEventListener('click', async () => {
+    const goal = document.getElementById('dash-goal').value.trim() || 'General focus';
+
+    await chrome.runtime.sendMessage({
+      type: 'START_FOCUS_SESSION',
+      duration: 25,
+      goal
+    });
+
+    showActiveSession(Date.now(), goal, 25 * 60 * 1000);
+
+    // Clear reasoning list
+    const list = document.getElementById('dash-reasoning-list');
+    list.innerHTML = '';
+  });
+
+  document.getElementById('dash-stop-btn').addEventListener('click', async () => {
+    await chrome.runtime.sendMessage({ type: 'STOP_SESSION' });
+    showIdleSession();
+  });
+}
+
+// Reasoning feed
+function renderReasoningLog(log) {
+  const list = document.getElementById('dash-reasoning-list');
+  if (!list) return;
+
+  const recent = log.slice(-20).reverse();
+  list.innerHTML = '';
+
+  for (const entry of recent) {
+    appendReasoningItem(list, entry);
+  }
+}
+
+function appendReasoningItem(list, entry) {
+  const li = document.createElement('li');
+  li.className = `reasoning-item type-${entry.type || 'observation'}`;
+  const time = new Date(entry.ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  li.innerHTML = `<span class="r-time">${time}</span> ${entry.message || entry.reason || ''}`;
+  list.prepend(li);
+
+  while (list.children.length > 20) {
+    list.removeChild(list.lastChild);
+  }
+}
+
+// Listen for live messages from background
+chrome.runtime.onMessage.addListener((message) => {
+  if (message.type === 'GEMINI_REASONING') {
+    const list = document.getElementById('dash-reasoning-list');
+    if (list) appendReasoningItem(list, message.entry);
+  }
+
+  if (message.type === 'SESSION_STARTED') {
+    if (!dashSessionActive) {
+      showActiveSession(message.startTime || Date.now(), message.goal, message.duration);
+    }
+  }
+
+  if (message.type === 'SESSION_ENDED') {
+    showIdleSession();
+  }
+
+  if (message.type === 'ATTENTION_UPDATE') {
+    // Could update a live score display if desired
+  }
+});
+
+// Main data load
 async function loadDashboardData() {
   let data;
   try {
     data = await chrome.runtime.sendMessage({ type: 'GET_DASHBOARD_DATA' });
   } catch (e) {
-    // Fallback to direct storage access
     data = await chrome.storage.local.get([
       'sessionHistory', 'dailyScores', 'dailyStats',
       'geminiInsights', 'userName', 'lastAnalysisTime'
@@ -36,20 +191,12 @@ async function loadDashboardData() {
 
   if (!data) return;
 
-  // Greeting
   const name = data.userName || '';
   document.getElementById('greeting').textContent = name ? `Hey ${name}!` : 'Hello!';
 
-  // Stats
   renderStats(data);
-
-  // Chart
   renderScoreChart(data.dailyScores || []);
-
-  // Insights
   renderInsights(data.geminiInsights);
-
-  // Session history
   renderSessionHistory(data.sessionHistory || []);
 }
 
@@ -65,7 +212,6 @@ function renderStats(data) {
 
   document.getElementById('stat-breaks').textContent = stats.breaks || 0;
 
-  // Average score from daily scores
   const dailyScores = data.dailyScores || [];
   const allScores = dailyScores.flatMap(d => d.scores.map(s => s.score));
   const avg = allScores.length > 0 ? Math.round(allScores.reduce((a, b) => a + b, 0) / allScores.length) : '--';
@@ -76,7 +222,6 @@ function renderScoreChart(dailyScores) {
   const canvas = document.getElementById('score-chart');
   const ctx = canvas.getContext('2d');
 
-  // Set canvas resolution
   const rect = canvas.parentElement.getBoundingClientRect();
   canvas.width = rect.width * 2;
   canvas.height = rect.height * 2;
@@ -89,7 +234,6 @@ function renderScoreChart(dailyScores) {
   const chartW = width - padding.left - padding.right;
   const chartH = height - padding.top - padding.bottom;
 
-  // Collect all data points
   let allPoints = [];
   dailyScores.forEach(day => {
     day.scores.forEach(s => {
@@ -97,7 +241,6 @@ function renderScoreChart(dailyScores) {
     });
   });
 
-  // If no data, show empty state
   if (allPoints.length === 0) {
     ctx.fillStyle = 'rgba(255,255,255,0.2)';
     ctx.font = '14px -apple-system, sans-serif';
@@ -106,10 +249,8 @@ function renderScoreChart(dailyScores) {
     return;
   }
 
-  // Limit to last 50 points for readability
   if (allPoints.length > 50) allPoints = allPoints.slice(-50);
 
-  // Draw grid lines
   ctx.strokeStyle = 'rgba(255,255,255,0.06)';
   ctx.lineWidth = 1;
   for (let i = 0; i <= 4; i++) {
@@ -119,15 +260,12 @@ function renderScoreChart(dailyScores) {
     ctx.lineTo(width - padding.right, y);
     ctx.stroke();
 
-    // Y-axis labels
     ctx.fillStyle = 'rgba(255,255,255,0.3)';
     ctx.font = '11px -apple-system, sans-serif';
     ctx.textAlign = 'right';
     ctx.fillText(100 - i * 25, padding.left - 10, y + 4);
   }
 
-  // Draw colored zones
-  // Green zone (70-100)
   const greenTop = padding.top;
   const greenBottom = padding.top + chartH * 0.3;
   const grad1 = ctx.createLinearGradient(0, greenTop, 0, greenBottom);
@@ -136,7 +274,6 @@ function renderScoreChart(dailyScores) {
   ctx.fillStyle = grad1;
   ctx.fillRect(padding.left, greenTop, chartW, greenBottom - greenTop);
 
-  // Red zone (0-40)
   const redTop = padding.top + chartH * 0.6;
   const redBottom = padding.top + chartH;
   const grad2 = ctx.createLinearGradient(0, redTop, 0, redBottom);
@@ -145,7 +282,6 @@ function renderScoreChart(dailyScores) {
   ctx.fillStyle = grad2;
   ctx.fillRect(padding.left, redTop, chartW, redBottom - redTop);
 
-  // Draw line
   ctx.beginPath();
   ctx.lineWidth = 2.5;
   ctx.lineJoin = 'round';
@@ -154,12 +290,10 @@ function renderScoreChart(dailyScores) {
   allPoints.forEach((point, i) => {
     const x = padding.left + (i / (allPoints.length - 1 || 1)) * chartW;
     const y = padding.top + (1 - point.score / 100) * chartH;
-
     if (i === 0) ctx.moveTo(x, y);
     else ctx.lineTo(x, y);
   });
 
-  // Gradient stroke
   const lineGrad = ctx.createLinearGradient(padding.left, 0, width - padding.right, 0);
   lineGrad.addColorStop(0, '#6366f1');
   lineGrad.addColorStop(0.5, '#8b5cf6');
@@ -167,7 +301,6 @@ function renderScoreChart(dailyScores) {
   ctx.strokeStyle = lineGrad;
   ctx.stroke();
 
-  // Fill area under line
   ctx.lineTo(padding.left + chartW, padding.top + chartH);
   ctx.lineTo(padding.left, padding.top + chartH);
   ctx.closePath();
@@ -178,13 +311,11 @@ function renderScoreChart(dailyScores) {
   ctx.fillStyle = fillGrad;
   ctx.fill();
 
-  // Draw dots on recent points
   const dotsToShow = Math.min(allPoints.length, 20);
   const startDot = allPoints.length - dotsToShow;
   for (let i = startDot; i < allPoints.length; i++) {
     const x = padding.left + (i / (allPoints.length - 1 || 1)) * chartW;
     const y = padding.top + (1 - allPoints[i].score / 100) * chartH;
-
     ctx.beginPath();
     ctx.arc(x, y, 3, 0, Math.PI * 2);
     const color = allPoints[i].score >= 70 ? '#10b981' : allPoints[i].score >= 40 ? '#f59e0b' : '#ef4444';
@@ -192,7 +323,6 @@ function renderScoreChart(dailyScores) {
     ctx.fill();
   }
 
-  // X-axis: show date labels
   const uniqueDates = [...new Set(allPoints.map(p => p.date))];
   ctx.fillStyle = 'rgba(255,255,255,0.3)';
   ctx.font = '10px -apple-system, sans-serif';
@@ -208,11 +338,9 @@ function renderInsights(insights) {
   const list = document.getElementById('insights-list');
   const suggestion = document.getElementById('suggestion-box');
 
-  if (!insights || !insights.insights || insights.insights.length === 0) {
-    return; // Keep empty state
-  }
+  if (!insights || !insights.insights || insights.insights.length === 0) return;
 
-  const icons = ['💡', '📊', '🎯', '⚡', '🧠'];
+  const icons = ['*', '#', '>', '!', '?'];
   list.innerHTML = insights.insights.map((text, i) =>
     `<li class="insight-item">
       <span class="insight-icon">${icons[i % icons.length]}</span>
@@ -220,7 +348,6 @@ function renderInsights(insights) {
     </li>`
   ).join('');
 
-  // Patterns
   if (insights.bestFocusTime) {
     document.getElementById('pat-time').textContent = capitalize(insights.bestFocusTime);
   }
@@ -228,13 +355,13 @@ function renderInsights(insights) {
     document.getElementById('pat-duration').textContent = insights.optimalDuration;
   }
   if (insights.trend) {
-    const trendEmoji = insights.trend === 'improving' ? '📈' : insights.trend === 'declining' ? '📉' : '➡️';
-    document.getElementById('pat-trend').textContent = trendEmoji + ' ' + capitalize(insights.trend);
+    const trendArrow = insights.trend === 'improving' ? '^' : insights.trend === 'declining' ? 'v' : '->';
+    document.getElementById('pat-trend').textContent = trendArrow + ' ' + capitalize(insights.trend);
   }
 
   if (insights.suggestion) {
     suggestion.style.display = 'block';
-    suggestion.innerHTML = `<strong>💡 Suggestion:</strong> ${insights.suggestion}`;
+    suggestion.innerHTML = `<strong>Suggestion:</strong> ${insights.suggestion}`;
   }
 }
 
@@ -242,7 +369,6 @@ function renderSessionHistory(sessions) {
   const list = document.getElementById('session-list');
   if (sessions.length === 0) return;
 
-  // Show most recent first, limit to 10
   const recent = sessions.slice(-10).reverse();
 
   list.innerHTML = recent.map(s => {
@@ -257,7 +383,7 @@ function renderSessionHistory(sessions) {
         <div class="session-rating ${ratingClass}">${rating}</div>
         <div class="session-info">
           <div class="session-goal">${s.goal || 'Focus Session'}</div>
-          <div class="session-meta">${dateStr} at ${timeStr} · ${s.duration || 0}min</div>
+          <div class="session-meta">${dateStr} at ${timeStr} - ${s.duration || 0}min</div>
           ${s.summary ? `<div class="session-summary">${s.summary}</div>` : ''}
         </div>
       </li>

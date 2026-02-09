@@ -53,13 +53,18 @@
         "offscreen.js",
         "quiz.html",
         "content-analyzer.js",
-        "dashboard.html"
+        "dashboard.html",
+        "mediapipe/*",
+        "mediapipe/wasm/*"
       ],
       "matches": [
         "<all_urls>"
       ]
     }
   ],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'"
+  },
   "icons": {
     "16": "icons/icon16.png",
     "48": "icons/icon48.png",

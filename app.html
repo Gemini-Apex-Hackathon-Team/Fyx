@@ -10,7 +10,7 @@
   <main class="app-shell">
     <section class="card setup-card">
       <h1>FYX Focus App</h1>
-      <p class="subtitle">Standalone mode with webcam focus tracking and Gemini agent coaching.</p>
+      <p class="subtitle">Webcam focus tracking with Gemini agent coaching. Session syncs with popup and dashboard.</p>
 
       <label for="goal">Session Goal</label>
       <input id="goal" type="text" placeholder="Finish chapter 3 notes">
@@ -20,7 +20,7 @@
         <button id="stop-btn" class="secondary" disabled>Stop</button>
       </div>
 
-      <p class="tiny">Gemini key is loaded from <code>local-config.js</code>. Camera processing stays local.</p>
+      <p class="tiny">Camera analysis runs via background service worker. Session persists across pages.</p>
     </section>
 
     <section class="card metrics-card">
@@ -52,7 +52,6 @@
     </section>
   </main>
 
-  <script src="local-config.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

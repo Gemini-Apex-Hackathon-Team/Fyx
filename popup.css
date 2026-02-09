@@ -195,6 +195,44 @@ body {
 }
 .fyx-link-btn:hover { color: var(--fyx-primary-light); background: rgba(99, 102, 241, 0.08); }
 
+/* Reasoning Feed */
+.fyx-reasoning-feed {
+  margin-top: 14px;
+  border-top: 1px solid var(--fyx-border);
+  padding-top: 12px;
+}
+.fyx-reasoning-feed h4 {
+  font-size: 12px;
+  color: var(--fyx-text-dim);
+  margin-bottom: 8px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+#reasoning-list {
+  list-style: none;
+  max-height: 160px;
+  overflow-y: auto;
+}
+#reasoning-list li {
+  font-size: 11px;
+  color: var(--fyx-text-muted);
+  padding: 6px 8px;
+  border-radius: 8px;
+  margin-bottom: 4px;
+  background: rgba(255,255,255,0.03);
+  border-left: 2px solid var(--fyx-primary);
+  line-height: 1.4;
+}
+#reasoning-list li .reasoning-time {
+  color: var(--fyx-text-dim);
+  font-size: 10px;
+}
+#reasoning-list li.type-intervention { border-left-color: var(--fyx-warning); }
+#reasoning-list li.type-nudge { border-left-color: var(--fyx-danger); }
+#reasoning-list li.type-observation { border-left-color: rgba(255,255,255,0.15); }
+#reasoning-list li.type-session_start { border-left-color: var(--fyx-success); }
+#reasoning-list li.type-session_end { border-left-color: var(--fyx-accent); }
+
 /* Animations */
 @keyframes scoreGlow {
   0%, 100% { filter: drop-shadow(0 0 8px rgba(99, 102, 241, 0.3)); }

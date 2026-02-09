@@ -382,7 +382,7 @@
         function loadQuiz(container, continueBtn) {
             // Request quiz from background
             chrome.runtime.sendMessage({ type: 'GET_BREAK_QUIZ' }, (response) => {
-                if (response && response.quiz) {
+                if (response && response.quiz && Array.isArray(response.quiz.options)) {
                     container.innerHTML = `
                         <div class="quiz-question">${response.quiz.question}</div>
                         <div class="quiz-options" id="quiz-options">

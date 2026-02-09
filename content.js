@@ -1,6 +1,12 @@
 // FYX Content Script
 // Tracks user engagement on pages and shows interventions
 
+// Guard against double-injection (manifest + scripting API)
+if (typeof window.__fyxContentLoaded !== 'undefined') {
+  // Already loaded — skip re-execution
+} else {
+window.__fyxContentLoaded = true;
+
 let engagementData = {
   timeVisible: 0,
   scrollCount: 0,
@@ -82,20 +88,23 @@ function initializeTracking() {
 
   // Cheap local signals to background agent runtime
   signalInterval = setInterval(() => {
-    const idleSeconds = Math.floor((Date.now() - engagementData.lastActivityTime) / 1000);
-    const interactionBursts = (engagementData.mouseMovements || 0) + (engagementData.keyPresses || 0);
-    chrome.runtime.sendMessage({
-      type: 'SIGNAL',
-      payload: {
-        idleSeconds,
-        visible: !document.hidden,
-        scrollCount: engagementData.scrollCount || 0,
-        interactionBursts,
-        faceDetected: latestCameraState.faceDetected,
-        cameraUserState: latestCameraState.cameraUserState,
-        tabSwitchesLastMinute: recentTabSwitches
-      }
-    }).catch(() => {});
+    try {
+      if (!chrome.runtime?.id) return; // extension context invalidated
+      const idleSeconds = Math.floor((Date.now() - engagementData.lastActivityTime) / 1000);
+      const interactionBursts = (engagementData.mouseMovements || 0) + (engagementData.keyPresses || 0);
+      chrome.runtime.sendMessage({
+        type: 'SIGNAL',
+        payload: {
+          idleSeconds,
+          visible: !document.hidden,
+          scrollCount: engagementData.scrollCount || 0,
+          interactionBursts,
+          faceDetected: latestCameraState.faceDetected,
+          cameraUserState: latestCameraState.cameraUserState,
+          tabSwitchesLastMinute: recentTabSwitches
+        }
+      }).catch(() => {});
+    } catch { return; }
 
     // decay counters so bursts represent recent activity
     engagementData.mouseMovements = 0;
@@ -110,10 +119,13 @@ function initializeTracking() {
       const metrics = event.detail || {};
       latestCameraState.faceDetected = !!metrics.faceDetected;
       latestCameraState.cameraUserState = metrics.userState || 'unknown';
-      chrome.runtime.sendMessage({
-        type: 'CAMERA_METRICS',
-        metrics
-      }).catch(() => {});
+      try {
+        if (!chrome.runtime?.id) return;
+        chrome.runtime.sendMessage({
+          type: 'CAMERA_METRICS',
+          metrics
+        }).catch(() => {});
+      } catch { /* context invalidated */ }
 
       updateCameraPanelStatus(metrics);
     });
@@ -232,7 +244,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (message.type === 'SHOW_QUIZ') {
-    showQuizOverlay(message.quiz);
+    const quiz = message.quiz && message.quiz.options ? message.quiz : {
+      question: 'What is the main idea of this page?',
+      options: ['Main concept', 'Minor detail', 'Unrelated point'],
+      correctIndex: 0,
+      explanation: 'Recall of the main concept restores focus.'
+    };
+    showQuizOverlay(quiz);
     sendResponse({ success: true });
     return true;
   }
@@ -377,6 +395,16 @@ function showInterventionOverlay(data) {
 
 // Show quiz overlay
 function showQuizOverlay(quiz) {
+  // Guard against undefined/malformed quiz data
+  if (!quiz || !Array.isArray(quiz.options) || quiz.options.length === 0) {
+    quiz = {
+      question: quiz?.question || 'What is the main idea of this page?',
+      options: ['Main concept', 'Minor detail', 'Unrelated point'],
+      correctIndex: 0,
+      explanation: quiz?.explanation || 'Quick recall helps your focus snap back.'
+    };
+  }
+
   const existing = document.getElementById('fyx-quiz-overlay');
   if (existing) existing.remove();
 
@@ -1048,3 +1076,5 @@ async function initializeCameraTracking() {
 
 
 // Camera runtime is managed by offscreen document from background.js.
+
+} // end double-injection guard

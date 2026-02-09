@@ -7,7 +7,7 @@ importScripts('gemini-session-manager.js');
 importScripts('intervention-decision.js');
 importScripts('local-config.js');
 
-const GEMINI_MODEL = 'gemini-2.0-flash';
+const GEMINI_MODEL = 'gemini-2.5-flash';
 const GEMINI_API_URL = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
 let geminiApiKey = (self.FYX_LOCAL_CONFIG && self.FYX_LOCAL_CONFIG.GEMINI_API_KEY) || '';
 
@@ -21,8 +21,13 @@ let focusSession = {
   workDuration: 25 * 60 * 1000,
   breakDuration: 5 * 60 * 1000,
   isWorking: false,
-  isPaused: false
+  isPaused: false,
+  startTime: null,
+  goal: ''
 };
+
+// Gemini reasoning log — last 30 entries, persisted in storage
+let geminiReasoningLog = [];
 
 let userConfig = {
   attentionLevel: 5,
@@ -32,12 +37,17 @@ let userConfig = {
   enableFaceTracking: true,
   enableContentQuiz: true,
   enableInterventions: true,
-  cameraEnabled: false
+  cameraEnabled: true
 };
 
 let sleepinessScore = null;
 let cameraUserState = 'unknown';
 let faceAbsentDuration = 0;
+
+// Latest face landmark data from offscreen MediaPipe FaceLandmarker or Gemini Vision
+let latestLandmarkData = null;
+let lastVisionCallTs = 0;
+let visionCallInProgress = false;
 
 let latestEngagement = {
   isVisible: true,
@@ -301,13 +311,34 @@ async function handleAgentSignal(tabId, signal) {
 
 async function initializeState() {
   try {
-    const saved = await chrome.storage.local.get(['userConfig', 'attentionScore']);
+    const saved = await chrome.storage.local.get(['userConfig', 'attentionScore', 'activeSession', 'geminiReasoningLog', 'geminiApiKey']);
     if (saved.userConfig) userConfig = { ...userConfig, ...saved.userConfig };
     if (typeof saved.attentionScore === 'number') attentionScore = saved.attentionScore;
-    offscreenEnabled = !!userConfig.cameraEnabled;
-    if (offscreenEnabled) {
-      await ensureOffscreenCamera();
+    if (Array.isArray(saved.geminiReasoningLog)) geminiReasoningLog = saved.geminiReasoningLog;
+
+    // Load API key from storage (overrides local-config.js)
+    if (saved.geminiApiKey) geminiApiKey = saved.geminiApiKey;
+
+    // Restore active session if it was running
+    if (saved.activeSession && saved.activeSession.running) {
+      focusSession.isWorking = true;
+      focusSession.startTime = saved.activeSession.startTime;
+      focusSession.goal = saved.activeSession.goal || '';
+      focusSession.workDuration = saved.activeSession.duration || 25 * 60 * 1000;
+      currentSessionDurationMs = focusSession.workDuration;
+      sessionStartTime = focusSession.startTime;
+
+      // Check if session should have ended
+      const elapsed = Date.now() - focusSession.startTime;
+      if (elapsed >= focusSession.workDuration) {
+        await stopFocusSession();
+      }
     }
+
+    // Camera is always on — force enable
+    userConfig.cameraEnabled = true;
+    offscreenEnabled = true;
+    await startOffscreenCameraCapture();
   } catch (error) {
     console.error('[FYX] Failed to initialize state:', error);
   }
@@ -362,7 +393,8 @@ function handleTabSwitch(tab) {
   }
 
   if (tabActivity.switches > 5) updateAttentionScore(-5);
-  injectContentScript(tab.id);
+  // Content script is already injected via manifest.json content_scripts.
+  // Do NOT re-inject here — it causes "Identifier already declared" errors.
 }
 
 function isBlockedSite(url) {
@@ -439,6 +471,16 @@ async function calculateAttentionScore() {
     }
 
     updateAttentionScore(scoreChange);
+
+    // Periodically log camera state for reasoning feed (every ~2 minutes)
+    if (focusSession.isWorking && Math.random() < 0.25) {
+      await logGeminiReasoning({
+        type: 'observation',
+        message: `Attention: ${attentionScore}/100 | Camera: ${getCameraStateDescription()} | Score change: ${scoreChange > 0 ? '+' : ''}${scoreChange}`,
+        score: attentionScore,
+        cameraState: cameraUserState
+      });
+    }
   } catch {
     // Ignore tabs where messages can't be sent
   }
@@ -504,6 +546,14 @@ async function checkForIntervention() {
       attentionScore
     }).catch(() => {});
 
+    await logGeminiReasoning({
+      type: 'nudge',
+      reason: 'Mild drift detected (score 4-6)',
+      message: 'Close one distractor tab and spend 60 seconds on the main idea.',
+      score: attentionScore,
+      signals: signalState.signals
+    });
+
     await chrome.storage.local.set({ lastInterventionTime: Date.now() });
     return;
   }
@@ -539,9 +589,21 @@ async function triggerAgenticIntervention(mode = 'auto', signalState = { score: 
 
   if (!decision) {
     decision = signalState.score >= 7
-      ? { type: 'break_tab', reason: 'Distraction is high', message: 'Let’s reset with a quick challenge.', topic: context.title }
+      ? { type: 'break_tab', reason: 'Distraction is high', message: 'Let\'s reset with a quick challenge.', topic: context.title }
       : { type: 'fun_popup', reason: 'Attention drift', message: aiResponse || 'Quick reset?', topic: context.title };
   }
+
+  // Log Gemini's reasoning for UI display
+  await logGeminiReasoning({
+    type: 'intervention',
+    interventionType: decision.type,
+    reason: decision.reason || '',
+    message: decision.message || '',
+    score: attentionScore,
+    distractionScore: signalState.score,
+    signals: signalState.signals,
+    cameraState: getCameraStateDescription()
+  });
 
   const stored = await chrome.storage.local.get('userName');
   const userName = stored.userName || '';
@@ -676,21 +738,78 @@ function getCameraStateDescription() {
   if (!userConfig.cameraEnabled || sleepinessScore === null) return 'Camera disabled';
   if (cameraUserState === 'absent') return `Face not detected for ${Math.round(faceAbsentDuration / 1000)}s`;
   if (cameraUserState === 'looking_away') return 'Looking away from screen';
-  if (cameraUserState === 'bored') return 'Restless movement detected';
+  if (cameraUserState === 'bored') return 'Eyes drooping / drowsy';
   return 'User appears focused';
+}
+
+async function logGeminiReasoning(entry) {
+  geminiReasoningLog.push({ ts: Date.now(), ...entry });
+  if (geminiReasoningLog.length > 30) geminiReasoningLog = geminiReasoningLog.slice(-30);
+  await chrome.storage.local.set({ geminiReasoningLog });
+  // Broadcast to all extension pages (popup, dashboard)
+  chrome.runtime.sendMessage({
+    type: 'GEMINI_REASONING',
+    entry: { ts: Date.now(), ...entry }
+  }).catch(() => {});
+}
+
+async function persistSessionState() {
+  await chrome.storage.local.set({
+    activeSession: {
+      running: focusSession.isWorking,
+      startTime: focusSession.startTime,
+      goal: focusSession.goal,
+      duration: focusSession.workDuration
+    }
+  });
+}
+
+function getLandmarkSummaryForGemini() {
+  if (!latestLandmarkData || !latestLandmarkData.facePresent) {
+    return 'No face landmark data available.';
+  }
+  const d = latestLandmarkData;
+  const bs = d.blendshapes || {};
+  const hp = d.headPose || {};
+  const lines = [
+    `Face detected: yes`,
+    `Eye openness (EAR): left=${d.leftEAR}, right=${d.rightEAR}, avg=${d.avgEAR}`,
+    `Eyes closed: ${d.eyesClosed}`,
+    `Head pose: yaw=${hp.yaw}deg, pitch=${hp.pitch}deg, roll=${hp.roll}deg`,
+    `Looking away: ${d.lookingAway}`,
+    `Mouth open: ${d.mouthOpen} (openness=${d.mouthOpenness})`,
+    `Blink: L=${bs.eyeBlinkLeft}, R=${bs.eyeBlinkRight}`,
+    `Squint: L=${bs.eyeSquintLeft}, R=${bs.eyeSquintRight}`,
+    `Brow: down_L=${bs.browDownLeft}, down_R=${bs.browDownRight}, inner_up=${bs.browInnerUp}`,
+    `Jaw open: ${bs.jawOpen}`,
+    `Smile: L=${bs.mouthSmileLeft}, R=${bs.mouthSmileRight}`,
+    `Gaze: up=${bs.eyeLookUpLeft}, down=${bs.eyeLookDownLeft}, in=${bs.eyeLookInLeft}, out=${bs.eyeLookOutLeft}`
+  ];
+  return lines.join('\n');
 }
 
 function generateInterventionPrompt(reason, context, mode = 'auto') {
   const cameraState = getCameraStateDescription();
+  const landmarkSummary = getLandmarkSummaryForGemini();
 
   const prompts = {
     low_attention: `You are FYX, a focus assistant. Attention is ${attentionScore}/100.
 Context: ${context.title}. Content: ${(context.contentExcerpt || '').substring(0, 300)}
 Camera: ${cameraState}
+
+Face Landmark Data:
+${landmarkSummary}
+
+Use the facial landmark data to understand the user's current state (drowsy, distracted, engaged, etc.).
 Give one short empathetic refocus suggestion under 40 words.`,
 
     break_suggestion: `You are FYX. Suggest a short break action.
 Attention: ${attentionScore}/100. Camera: ${cameraState}
+
+Face Landmark Data:
+${landmarkSummary}
+
+Use the landmark data to tailor your break suggestion (e.g. eye exercises if eyes are strained, stretch if posture is off).
 Return one activity + duration in under 30 words.`,
 
     agentic_intervention: `You are FYX agent orchestrator.
@@ -705,10 +824,19 @@ Signals: ${(context.distractionSignals || []).join(', ') || 'none'}
 Idle seconds: ${context.idleSeconds || 0}
 Tab switches last minute: ${context.tabSwitchesLastMinute || 0}
 
+Face Landmark Data:
+${landmarkSummary}
+
+Use the facial landmark data to make better intervention decisions. For example:
+- High blink rate or eye squinting suggests eye strain -> suggest eye break
+- Head tilted or looking away -> user is distracted
+- Jaw open / yawning -> user is tired
+- Brows furrowed -> user may be frustrated or concentrating hard
+
 Return strict JSON:
 {
   "type": "none" | "fun_popup" | "quiz" | "blink_screen" | "break" | "quiz_game" | "break_tab",
-  "reason": "brief reason",
+  "reason": "brief reason based on landmark + behavior signals",
   "message": "short user-facing message",
   "topic": "topic",
   "quiz": { "question": "...", "options": ["a","b","c"], "correctIndex": 0, "explanation": "..." },
@@ -764,6 +892,155 @@ async function callGeminiAPI(prompt) {
   }
 }
 
+// --- Gemini Vision API for face analysis from camera frames ---
+async function callGeminiVisionAPI(base64Frame) {
+  if (!geminiApiKey || geminiApiKey === 'PASTE_NEW_GEMINI_KEY_HERE') {
+    return null;
+  }
+
+  const prompt = `Analyze this webcam frame for focus/attention tracking. Determine the person's state.
+
+Return ONLY valid JSON (no markdown):
+{
+  "facePresent": true/false,
+  "eyesClosed": true/false,
+  "lookingAway": true/false,
+  "mouthOpen": true/false,
+  "headPose": { "yaw": number_degrees, "pitch": number_degrees },
+  "attentionState": "focused" | "drowsy" | "distracted" | "absent",
+  "confidence": 0.0 to 1.0,
+  "details": "brief description of what you observe"
+}
+
+If no face is visible, set facePresent to false and attentionState to "absent".`;
+
+  try {
+    const response = await fetch(`${GEMINI_API_URL}?key=${geminiApiKey}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        contents: [{
+          parts: [
+            { inlineData: { mimeType: 'image/jpeg', data: base64Frame } },
+            { text: prompt }
+          ]
+        }],
+        generationConfig: {
+          temperature: 0.3,
+          maxOutputTokens: 300,
+          responseMimeType: 'application/json'
+        }
+      })
+    });
+
+    if (!response.ok) {
+      console.error('[FYX] Gemini Vision HTTP', response.status);
+      return null;
+    }
+
+    const data = await response.json();
+    const text = data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+
+    try {
+      return JSON.parse(text);
+    } catch {
+      const jsonMatch = text.match(/\{[\s\S]*\}/);
+      if (jsonMatch) return JSON.parse(jsonMatch[0]);
+      return null;
+    }
+  } catch (error) {
+    console.error('[FYX] Gemini Vision API error:', error);
+    return null;
+  }
+}
+
+async function handleCameraFrame(base64Frame, ts) {
+  // Rate limit: max 1 vision call every 3 seconds
+  const now = Date.now();
+  if (now - lastVisionCallTs < 3000 || visionCallInProgress) return;
+
+  lastVisionCallTs = now;
+  visionCallInProgress = true;
+
+  try {
+    const analysis = await callGeminiVisionAPI(base64Frame);
+    if (!analysis) return;
+
+    // Convert Gemini Vision response to same format as MediaPipe CAMERA_SIGNAL
+    const facePresent = analysis.facePresent !== false;
+    const eyesClosed = analysis.eyesClosed === true;
+    const lookingAway = analysis.lookingAway === true;
+    const mouthOpen = analysis.mouthOpen === true;
+    const headPose = analysis.headPose || { yaw: 0, pitch: 0 };
+
+    // Update camera state (same vars as MediaPipe path)
+    latestLandmarkData = {
+      ts: now,
+      facePresent,
+      eyesClosed,
+      lookingAway,
+      mouthOpen,
+      avgEAR: eyesClosed ? 0.1 : 0.3,
+      leftEAR: eyesClosed ? 0.1 : 0.3,
+      rightEAR: eyesClosed ? 0.1 : 0.3,
+      mouthOpenness: mouthOpen ? 0.06 : 0.01,
+      headPose: {
+        yaw: headPose.yaw || 0,
+        pitch: headPose.pitch || 0,
+        roll: 0
+      },
+      headPosition: { x: 0.5, y: 0.5 },
+      blendshapes: {},
+      visionAnalysis: analysis
+    };
+
+    // Update sleepiness/camera state
+    if (facePresent) {
+      if (analysis.attentionState === 'drowsy') {
+        sleepinessScore = 30;
+        cameraUserState = 'bored';
+      } else if (analysis.attentionState === 'distracted' || lookingAway) {
+        sleepinessScore = 60;
+        cameraUserState = 'looking_away';
+      } else {
+        sleepinessScore = 90;
+        cameraUserState = 'focused';
+      }
+      faceAbsentDuration = 0;
+    } else {
+      sleepinessScore = 0;
+      cameraUserState = 'absent';
+      faceAbsentDuration += 4000;
+    }
+
+    // Store as cameraSignal for popup display
+    await chrome.storage.local.set({
+      cameraSignal: {
+        ts: now,
+        facePresent,
+        eyesClosed,
+        lookingAway,
+        detectorMode: 'gemini-vision'
+      }
+    });
+
+    // Log Gemini's thinking process to reasoning feed
+    if (focusSession.isWorking && analysis.details) {
+      await logGeminiReasoning({
+        type: 'observation',
+        message: `Vision: ${analysis.details} | State: ${analysis.attentionState} | Confidence: ${analysis.confidence}`,
+        score: attentionScore,
+        cameraState: cameraUserState,
+        detectorMode: 'gemini-vision'
+      });
+    }
+  } catch (error) {
+    console.error('[FYX] handleCameraFrame error:', error);
+  } finally {
+    visionCallInProgress = false;
+  }
+}
+
 async function triggerContentQuiz() {
   if (!currentTab) return;
 
@@ -795,7 +1072,12 @@ Return JSON:
   const response = await callGeminiAPI(prompt);
   try {
     const jsonMatch = response.match(/\{[\s\S]*\}/);
-    if (jsonMatch) return JSON.parse(jsonMatch[0]);
+    if (jsonMatch) {
+      const parsed = JSON.parse(jsonMatch[0]);
+      if (parsed && parsed.question && Array.isArray(parsed.options) && parsed.options.length > 0) {
+        return parsed;
+      }
+    }
   } catch {
     // fallback below
   }
@@ -814,6 +1096,16 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       if (message.type === 'UPDATE_CONFIG') {
         userConfig = { ...userConfig, ...message.config };
         await chrome.storage.local.set({ userConfig });
+        sendResponse({ success: true });
+      }
+
+      if (message.type === 'UPDATE_API_KEY') {
+        if (message.key) {
+          geminiApiKey = message.key;
+        } else {
+          // Fall back to local-config.js default
+          geminiApiKey = (self.FYX_LOCAL_CONFIG && self.FYX_LOCAL_CONFIG.GEMINI_API_KEY) || '';
+        }
         sendResponse({ success: true });
       }
 
@@ -840,7 +1132,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       }
 
       if (message.type === 'START_FOCUS_SESSION') {
-        await startFocusSession(message.duration);
+        await startFocusSession(message.duration, message.goal || '');
         sendResponse({ success: true });
       }
 
@@ -870,18 +1162,55 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         sendResponse({ success: true });
       }
 
+      if (message.type === 'CAMERA_FRAME') {
+        // Gemini Vision fallback: offscreen sends base64 camera frame
+        handleCameraFrame(message.frame, message.ts);
+        sendResponse({ success: true });
+      }
+
       if (message.type === 'CAMERA_SIGNAL') {
         await chrome.storage.local.set({ cameraSignal: message });
+
+        // Store full landmark data for Gemini prompts
+        if (message.detectorMode === 'mediapipe-landmarker') {
+          latestLandmarkData = {
+            ts: message.ts,
+            facePresent: message.facePresent,
+            eyesClosed: message.eyesClosed,
+            lookingAway: message.lookingAway,
+            mouthOpen: message.mouthOpen,
+            avgEAR: message.avgEAR,
+            leftEAR: message.leftEAR,
+            rightEAR: message.rightEAR,
+            mouthOpenness: message.mouthOpenness,
+            headPose: message.headPose,
+            headPosition: message.headPosition,
+            blendshapes: message.blendshapes
+          };
+        }
+
         if (message.facePresent === true) {
-          sleepinessScore = message.eyesClosed === true ? 35 : 80;
-          cameraUserState = message.lookingAway === true ? 'looking_away' : (message.eyesClosed === true ? 'bored' : 'focused');
+          // Use landmark-based scoring when available
+          if (message.avgEAR !== undefined) {
+            // EAR-based sleepiness: low EAR = eyes closing = sleepy
+            const ear = message.avgEAR;
+            if (ear < 0.12) sleepinessScore = 15; // eyes nearly shut
+            else if (ear < 0.18) sleepinessScore = 40; // eyes drooping
+            else if (ear < 0.25) sleepinessScore = 70; // partially open
+            else sleepinessScore = 90; // eyes open
+          } else {
+            sleepinessScore = message.eyesClosed === true ? 35 : 80;
+          }
+
+          if (message.lookingAway === true) cameraUserState = 'looking_away';
+          else if (message.eyesClosed === true) cameraUserState = 'bored';
+          else cameraUserState = 'focused';
           faceAbsentDuration = 0;
         } else if (message.facePresent === false) {
           sleepinessScore = 0;
           cameraUserState = 'absent';
-          faceAbsentDuration = 1000;
+          faceAbsentDuration += 100; // accumulate since signals come ~every 100ms
         } else {
-          // Camera-only mode: no reliable face inference. Keep camera state neutral.
           sleepinessScore = null;
           cameraUserState = 'unknown';
           faceAbsentDuration = 0;
@@ -900,7 +1229,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       }
 
       if (message.type === 'GET_SESSION_STATE') {
-        sendResponse(geminiSession ? geminiSession.getState() : { active: false });
+        sendResponse({
+          active: focusSession.isWorking,
+          startTime: focusSession.startTime,
+          goal: focusSession.goal,
+          duration: focusSession.workDuration,
+          attentionScore,
+          geminiReasoningLog
+        });
       }
 
       if (message.type === 'ENABLE_CAMERA') {
@@ -916,6 +1252,16 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         await analyzeUserPatterns();
         const insights = await chrome.storage.local.get('geminiInsights');
         sendResponse(insights.geminiInsights || {});
+      }
+
+      if (message.type === 'GET_LANDMARK_DATA') {
+        sendResponse({
+          success: true,
+          landmarks: latestLandmarkData,
+          cameraUserState,
+          sleepinessScore,
+          faceAbsentDuration
+        });
       }
 
       if (message.type === 'GET_DASHBOARD_DATA') {
@@ -978,30 +1324,35 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       }
 
       if (message.type === 'GEN_QUIZ') {
-        const payload = {
-          content: message.content || '',
-          title: message.title || 'Untitled'
-        };
+        const content = message.content || '';
+        const title = message.title || 'Untitled';
 
-        const workerResponse = await fetch('https://focus-quiz-api.amaasabea09.workers.dev', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(payload)
-        });
+        let quiz = null;
 
-        if (!workerResponse.ok) {
-          sendResponse({
-            success: false,
-            error: `Quiz worker HTTP ${workerResponse.status}`
+        // Try external worker first
+        try {
+          const workerResponse = await fetch('https://focus-quiz-api.amaasabea09.workers.dev', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ content, title })
           });
-          return;
+
+          if (workerResponse.ok) {
+            const quizJson = await workerResponse.json();
+            if (quizJson && Array.isArray(quizJson.options) && quizJson.options.length > 0) {
+              quiz = quizJson;
+            }
+          }
+        } catch {
+          // Worker failed, fall through to Gemini
         }
 
-        const quizJson = await workerResponse.json();
-        sendResponse({
-          success: true,
-          quiz: quizJson
-        });
+        // Fallback: generate quiz via Gemini using page content
+        if (!quiz) {
+          quiz = await generateQuiz({ text: content, title });
+        }
+
+        sendResponse({ success: true, quiz });
       }
     } catch (error) {
       sendResponse({ success: false, error: error.message });
@@ -1027,19 +1378,30 @@ async function startFocusSession(duration, goal = '') {
   focusSession.workDuration = currentSessionDurationMs;
   focusSession.isWorking = true;
   focusSession.isPaused = false;
+  focusSession.startTime = Date.now();
+  focusSession.goal = goal;
+  sessionStartTime = focusSession.startTime;
 
-  // Local-only monitoring session. Gemini is called only on high-confidence distraction
-  // or when quiz/game generation is required.
   geminiSession = null;
   const sessionData = {
     message: 'Session started. Local monitoring active.',
     suggestions: ['Keep one tab open for the main task.']
   };
 
+  // Persist to storage so popup/dashboard can restore
+  await persistSessionState();
+
+  await logGeminiReasoning({
+    type: 'session_start',
+    message: `Focus session started: "${goal || 'General focus'}" for ${Math.round(currentSessionDurationMs / 60000)} min`
+  });
+
   chrome.runtime.sendMessage({
     type: 'SESSION_STARTED',
     suggestions: sessionData.suggestions,
-    goal
+    goal,
+    startTime: focusSession.startTime,
+    duration: currentSessionDurationMs
   }).catch(() => {});
 
   chrome.alarms.create('sessionEnd', { delayInMinutes: currentSessionDurationMs / 60000 });
@@ -1056,19 +1418,35 @@ async function handleSessionTabUpdate(tabId, changeInfo, tab) {
 }
 
 async function stopFocusSession() {
+  const wasRunning = focusSession.isWorking;
   focusSession.isWorking = false;
   focusSession.isPaused = false;
 
+  const elapsed = focusSession.startTime
+    ? Math.round((Date.now() - focusSession.startTime) / 60000)
+    : Math.round(currentSessionDurationMs / 60000);
+
   let summary = {
-    duration: Math.round(currentSessionDurationMs / 60000),
-    goal: '',
+    duration: elapsed,
+    goal: focusSession.goal || '',
     focusRating: Math.max(1, Math.min(10, Math.round(attentionScore / 10))),
     summary: 'Session completed with local distraction monitoring.',
     tabsVisited: tabActivity.switches
   };
 
+  focusSession.startTime = null;
+  focusSession.goal = '';
+
   await saveSessionData(summary);
+  await persistSessionState();
   chrome.alarms.clear('sessionEnd');
+
+  if (wasRunning) {
+    await logGeminiReasoning({
+      type: 'session_end',
+      message: `Session ended. Duration: ${elapsed}min, Focus rating: ${summary.focusRating}/10`
+    });
+  }
 
   chrome.runtime.sendMessage({ type: 'SESSION_ENDED', summary }).catch(() => {});
 

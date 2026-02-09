@@ -14,9 +14,40 @@ document.addEventListener('DOMContentLoaded', async () => {
   await loadSettings();
   await loadLatestInsight();
   await loadCameraRuntime();
+  await restoreSessionState();
   setupEventListeners();
   updateScoreDisplay();
 });
+
+// Restore session state from background
+async function restoreSessionState() {
+  try {
+    const state = await chrome.runtime.sendMessage({ type: 'GET_SESSION_STATE' });
+    if (state && state.active) {
+      sessionActive = true;
+      sessionStartTime = state.startTime;
+      sessionDuration = (state.duration || 25 * 60 * 1000) / 1000;
+
+      // Show session UI
+      document.querySelector('.fyx-quick-actions').style.display = 'none';
+      document.getElementById('session-info').style.display = 'block';
+      document.getElementById('score-section').style.display = '';
+
+      if (state.goal) {
+        document.getElementById('session-goal-label').textContent = state.goal;
+      }
+
+      // Start timer display
+      updateSessionTimer();
+      sessionTimer = setInterval(updateSessionTimer, 1000);
+
+      // Load reasoning log
+      renderReasoningLog(state.geminiReasoningLog || []);
+    }
+  } catch {
+    // Background not ready yet
+  }
+}
 
 // Load user name for greeting
 async function loadUserGreeting() {
@@ -122,7 +153,6 @@ function updateScoreDisplay() {
 
   scoreValue.textContent = Math.round(attentionScore);
 
-  // Update status text and color
   if (attentionScore >= 80) {
     scoreStatus.textContent = 'Excellent Focus';
     scoreStatus.style.color = '#10b981';
@@ -137,7 +167,6 @@ function updateScoreDisplay() {
     scoreStatus.style.color = '#ef4444';
   }
 
-  // Update circle progress (circumference = 2 * PI * 52)
   const circumference = 2 * Math.PI * 52;
   const offset = circumference - (attentionScore / 100) * circumference;
   scoreProgress.style.strokeDasharray = circumference;
@@ -154,7 +183,6 @@ async function loadStatistics() {
     date: new Date().toDateString()
   };
 
-  // Reset if new day
   if (dailyStats.date !== new Date().toDateString()) {
     dailyStats.sessions = 0;
     dailyStats.focusTime = 0;
@@ -171,10 +199,7 @@ async function loadStatistics() {
 function formatTime(seconds) {
   const hours = Math.floor(seconds / 3600);
   const minutes = Math.floor((seconds % 3600) / 60);
-
-  if (hours > 0) {
-    return `${hours}h ${minutes}m`;
-  }
+  if (hours > 0) return `${hours}h ${minutes}m`;
   return `${minutes}m`;
 }
 
@@ -186,83 +211,121 @@ async function loadSettings() {
   if (userConfig.enableContentQuiz !== undefined) {
     document.getElementById('enable-quizzes').checked = userConfig.enableContentQuiz;
   }
-
   if (userConfig.enableInterventions !== undefined) {
     document.getElementById('enable-interventions').checked = userConfig.enableInterventions;
   }
-
   if (userConfig.enableBreaks !== undefined) {
     document.getElementById('enable-breaks').checked = userConfig.enableBreaks;
   }
-
   if (userConfig.quizFrequency) {
     document.getElementById('quiz-frequency').value = userConfig.quizFrequency;
   }
-
   if (userConfig.cameraEnabled !== undefined) {
     document.getElementById('enable-camera').checked = userConfig.cameraEnabled;
   }
 }
 
+// Render reasoning log
+function renderReasoningLog(log) {
+  const list = document.getElementById('reasoning-list');
+  if (!list) return;
+
+  const recent = log.slice(-10).reverse();
+  list.innerHTML = '';
+
+  for (const entry of recent) {
+    const li = document.createElement('li');
+    li.className = `type-${entry.type || 'observation'}`;
+    const time = new Date(entry.ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    li.innerHTML = `<span class="reasoning-time">${time}</span> ${entry.message || entry.reason || ''}`;
+    list.appendChild(li);
+  }
+}
+
+function addReasoningEntry(entry) {
+  const list = document.getElementById('reasoning-list');
+  if (!list) return;
+
+  const li = document.createElement('li');
+  li.className = `type-${entry.type || 'observation'}`;
+  const time = new Date(entry.ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  li.innerHTML = `<span class="reasoning-time">${time}</span> ${entry.message || entry.reason || ''}`;
+  list.prepend(li);
+
+  // Keep max 10 entries in view
+  while (list.children.length > 10) {
+    list.removeChild(list.lastChild);
+  }
+}
+
 // Setup event listeners
 function setupEventListeners() {
-  // Start focus session
   document.getElementById('start-session').addEventListener('click', startFocusSession);
 
-  // Take break
   document.getElementById('take-break').addEventListener('click', () => {
     chrome.runtime.sendMessage({ type: 'REQUEST_BREAK' });
     updateStatistic('breaks', 1);
   });
 
-  // Stop session
   document.getElementById('stop-session')?.addEventListener('click', stopFocusSession);
 
-  // Settings changes
   document.getElementById('enable-quizzes').addEventListener('change', (e) => {
     updateConfig({ enableContentQuiz: e.target.checked });
   });
-
   document.getElementById('enable-interventions').addEventListener('change', (e) => {
     updateConfig({ enableInterventions: e.target.checked });
   });
-
   document.getElementById('enable-breaks').addEventListener('change', (e) => {
     updateConfig({ enableBreaks: e.target.checked });
   });
-
   document.getElementById('quiz-frequency').addEventListener('change', (e) => {
     updateConfig({ quizFrequency: parseInt(e.target.value) });
   });
 
-  // Camera tracking
+  // Gemini API Key — load/save from storage, fallback to local-config.js
+  const apiKeyInput = document.getElementById('gemini-api-key');
+  const apiKeyStatus = document.getElementById('api-key-status');
+
+  chrome.storage.local.get(['geminiApiKey']).then(keyData => {
+    if (keyData.geminiApiKey) {
+      apiKeyInput.value = keyData.geminiApiKey;
+      apiKeyStatus.textContent = 'Key saved';
+      apiKeyStatus.style.color = '#10b981';
+    } else {
+      apiKeyStatus.textContent = 'Using local-config.js';
+      apiKeyStatus.style.color = 'rgba(255,255,255,0.4)';
+    }
+  });
+
+  apiKeyInput.addEventListener('change', () => {
+    const key = apiKeyInput.value.trim();
+    if (key) {
+      chrome.storage.local.set({ geminiApiKey: key });
+      chrome.runtime.sendMessage({ type: 'UPDATE_API_KEY', key }).catch(() => {});
+      apiKeyStatus.textContent = 'Key saved';
+      apiKeyStatus.style.color = '#10b981';
+    } else {
+      chrome.storage.local.remove('geminiApiKey');
+      chrome.runtime.sendMessage({ type: 'UPDATE_API_KEY', key: '' }).catch(() => {});
+      apiKeyStatus.textContent = 'Using local-config.js';
+      apiKeyStatus.style.color = 'rgba(255,255,255,0.4)';
+    }
+  });
+
   document.getElementById('enable-camera').addEventListener('change', async (e) => {
     const enabled = e.target.checked;
     await updateConfig({ cameraEnabled: enabled });
-
-    // Notify all tabs to enable/disable camera
     const tabs = await chrome.tabs.query({});
     tabs.forEach(tab => {
-      chrome.tabs.sendMessage(tab.id, {
-        type: 'ENABLE_CAMERA',
-        enabled: enabled
-      }).catch(() => { });
+      chrome.tabs.sendMessage(tab.id, { type: 'ENABLE_CAMERA', enabled }).catch(() => {});
     });
-
-    // Also notify background
-    chrome.runtime.sendMessage({
-      type: 'ENABLE_CAMERA',
-      enabled: enabled
-    });
-
+    chrome.runtime.sendMessage({ type: 'ENABLE_CAMERA', enabled });
     setTimeout(loadCameraRuntime, 300);
   });
 
-  // Footer buttons
   document.getElementById('open-settings')?.addEventListener('click', () => {
     chrome.tabs.create({ url: 'app.html' });
   });
-
   document.getElementById('open-dashboard').addEventListener('click', () => {
     chrome.tabs.create({ url: 'dashboard.html' });
   });
@@ -273,15 +336,17 @@ function startFocusSession() {
   sessionActive = true;
   sessionStartTime = Date.now();
 
-  // Show session info, hide quick actions
   document.querySelector('.fyx-quick-actions').style.display = 'none';
   document.getElementById('session-info').style.display = 'block';
+  document.getElementById('score-section').style.display = '';
 
-  // Start timer
   updateSessionTimer();
   sessionTimer = setInterval(updateSessionTimer, 1000);
 
-  // Notify background script
+  // Clear previous reasoning
+  const list = document.getElementById('reasoning-list');
+  if (list) list.innerHTML = '';
+
   chrome.runtime.sendMessage({
     type: 'START_FOCUS_SESSION',
     duration: sessionDuration / 60
@@ -299,15 +364,16 @@ function stopFocusSession() {
     sessionTimer = null;
   }
 
-  // Calculate focus time
-  const focusTime = Math.floor((Date.now() - sessionStartTime) / 1000);
+  const focusTime = sessionStartTime ? Math.floor((Date.now() - sessionStartTime) / 1000) : 0;
   updateStatistic('focusTime', focusTime);
 
-  // Reset UI
   document.querySelector('.fyx-quick-actions').style.display = 'flex';
   document.getElementById('session-info').style.display = 'none';
+  document.getElementById('score-section').style.display = 'none';
 
   sessionStartTime = null;
+
+  chrome.runtime.sendMessage({ type: 'STOP_SESSION' });
 }
 
 // Update session timer
@@ -330,26 +396,19 @@ function updateSessionTimer() {
 
 // Update configuration
 async function updateConfig(changes) {
-  await chrome.runtime.sendMessage({
-    type: 'UPDATE_CONFIG',
-    config: changes
-  });
+  await chrome.runtime.sendMessage({ type: 'UPDATE_CONFIG', config: changes });
 }
 
 // Update statistics
 async function updateStatistic(key, increment) {
   const stats = await chrome.storage.local.get(['dailyStats']);
   const dailyStats = stats.dailyStats || {
-    sessions: 0,
-    focusTime: 0,
-    breaks: 0,
-    date: new Date().toDateString()
+    sessions: 0, focusTime: 0, breaks: 0, date: new Date().toDateString()
   };
 
   dailyStats[key] += increment;
   await chrome.storage.local.set({ dailyStats });
 
-  // Update display
   if (key === 'focusTime') {
     document.getElementById(`stat-${key}`).textContent = formatTime(dailyStats[key]);
   } else {
@@ -357,11 +416,42 @@ async function updateStatistic(key, increment) {
   }
 }
 
-// Listen for attention score updates
+// Listen for messages from background
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.type === 'ATTENTION_UPDATE') {
     attentionScore = message.score;
     updateScoreDisplay();
+  }
+
+  if (message.type === 'GEMINI_REASONING') {
+    addReasoningEntry(message.entry);
+  }
+
+  if (message.type === 'SESSION_ENDED') {
+    sessionActive = false;
+    if (sessionTimer) {
+      clearInterval(sessionTimer);
+      sessionTimer = null;
+    }
+    document.querySelector('.fyx-quick-actions').style.display = 'flex';
+    document.getElementById('session-info').style.display = 'none';
+    document.getElementById('score-section').style.display = 'none';
+  }
+
+  if (message.type === 'SESSION_STARTED') {
+    if (!sessionActive) {
+      sessionActive = true;
+      sessionStartTime = message.startTime || Date.now();
+      sessionDuration = (message.duration || 25 * 60 * 1000) / 1000;
+      document.querySelector('.fyx-quick-actions').style.display = 'none';
+      document.getElementById('session-info').style.display = 'block';
+      document.getElementById('score-section').style.display = '';
+      if (message.goal) {
+        document.getElementById('session-goal-label').textContent = message.goal;
+      }
+      updateSessionTimer();
+      sessionTimer = setInterval(updateSessionTimer, 1000);
+    }
   }
 });
 
