@@ -1170,6 +1170,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         sendResponse({ success: true });
       }
 
+      else if (message.type === 'CAMERA_PREVIEW_FRAME') {
+        // Preview frame from offscreen for popup display
+        await chrome.storage.local.set({ cameraPreviewFrame: message.frame });
+        sendResponse({ success: true });
+      }
+
       else if (message.type === 'CAMERA_FRAME') {
         // Gemini Vision fallback: offscreen sends base64 camera frame
         handleCameraFrame(message.frame, message.ts);

@@ -246,6 +246,7 @@ function startVisionFallback() {
 
 async function startCamera() {
   if (started) return;
+  started = true; // Set early to prevent race conditions
 
   try {
     // Try MediaPipe first
@@ -260,8 +261,6 @@ async function startCamera() {
     video.srcObject = stream;
     await video.play();
 
-    started = true;
-
     heartbeatTimer = setInterval(() => {
       send({
         type: 'CAMERA_HEARTBEAT',
@@ -271,15 +270,16 @@ async function startCamera() {
       });
     }, 2000);
 
-    // Write a preview frame to storage every 500ms for popup camera preview
+    // Write a preview frame to storage every 1000ms for popup camera preview
+    // Note: offscreen documents can't access chrome.storage directly, so send via message
     setInterval(() => {
       if (!started || video.readyState < 2) return;
       canvas.width = 160;
       canvas.height = 120;
       ctx.drawImage(video, 0, 0, 160, 120);
-      const previewDataUrl = canvas.toDataURL('image/jpeg', 0.4);
-      chrome.storage.local.set({ cameraPreviewFrame: previewDataUrl });
-    }, 500);
+      const previewDataUrl = canvas.toDataURL('image/jpeg', 0.5);
+      send({ type: 'CAMERA_PREVIEW_FRAME', frame: previewDataUrl });
+    }, 1000);
 
     if (landmarkerReady) {
       // MediaPipe WASM works — use it
