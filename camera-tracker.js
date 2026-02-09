@@ -1,27 +1,23 @@
-// FYX Camera Tracker - CSP-safe face monitoring
-// Uses browser FaceDetector API (no remote scripts/CDN required)
+// FYX Camera Tracker — Content Script Bridge
+// Receives face landmark state from the background offscreen document
+// and dispatches sleepinessMetrics events for content.js to consume.
+// No camera is opened here — the offscreen document handles all detection.
 
 class CameraTracker {
   constructor() {
-    this.video = null;
-    this.canvas = null;
-    this.ctx = null;
-    this.stream = null;
     this.isRunning = false;
-
-    this.detector = null;
-    this.detectorMode = 'face-detector'; // face-detector | camera-only
-    this.faceDetected = false;
-    this.faceAbsentSince = null;
-
-    this.lastFaceBox = null;
-    this.lastCenter = null;
-    this.movementHistory = [];
-    this.lastFrameTime = Date.now();
+    this.pollTimer = null;
 
     this.sleepinessScore = 100;
-    this.userState = 'focused'; // focused | looking_away | absent | bored
+    this.userState = 'focused';
+    this.faceDetected = false;
+    this.faceAbsentDuration = 0;
+    this.detectorMode = 'mediapipe-landmarker';
 
+    // Landmark data from background
+    this.landmarks = null;
+
+    // Calibration (kept for compatibility)
     this.calibratedCenter = null;
     this.calibratedArea = null;
     this.lookAwayThreshold = 0.12;
@@ -29,228 +25,74 @@ class CameraTracker {
   }
 
   async initialize() {
-    if (!('FaceDetector' in window)) {
-      console.warn('[CameraTracker] FaceDetector API not available, using camera-only fallback');
-      this.detectorMode = 'camera-only';
-      return true;
-    }
-
-    try {
-      this.detector = new FaceDetector({ fastMode: true, maxDetectedFaces: 1 });
-      this.detectorMode = 'face-detector';
-      return true;
-    } catch (error) {
-      console.warn('[CameraTracker] Failed to initialize FaceDetector, using camera-only fallback:', error);
-      this.detectorMode = 'camera-only';
-      return true;
-    }
+    // No local initialization needed — offscreen handles MediaPipe
+    return true;
   }
 
   async requestCameraAccess() {
-    try {
-      this.stream = await navigator.mediaDevices.getUserMedia({
-        video: {
-          width: { ideal: 640 },
-          height: { ideal: 480 },
-          frameRate: { ideal: 15, max: 20 }
-        }
-      });
-      return true;
-    } catch (error) {
-      console.error('[CameraTracker] Camera access denied:', error);
-      return false;
-    }
+    // Camera is managed by the offscreen document, not here
+    return true;
   }
 
-  async start(videoElement, canvasElement) {
+  async start() {
     if (this.isRunning) return;
-
-    this.video = videoElement;
-    this.canvas = canvasElement;
-    this.ctx = this.canvas ? this.canvas.getContext('2d') : null;
-
-    const hasAccess = await this.requestCameraAccess();
-    if (!hasAccess) {
-      throw new Error('Camera access denied');
-    }
-
-    this.video.srcObject = this.stream;
-    await this.video.play();
-
     this.isRunning = true;
-    this.processFrame();
 
-    console.log('[CameraTracker] Started (FaceDetector mode)');
+    // Poll background for landmark data every 200ms
+    this.pollTimer = setInterval(() => this.pollLandmarks(), 200);
+    console.log('[CameraTracker] Started (bridge mode — offscreen provides landmarks)');
   }
 
   stop() {
     if (!this.isRunning) return;
-
     this.isRunning = false;
 
-    if (this.stream) {
-      this.stream.getTracks().forEach((track) => track.stop());
-      this.stream = null;
-    }
-
-    if (this.video) {
-      this.video.srcObject = null;
-    }
-
-    if (this.ctx && this.canvas) {
-      this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
+    if (this.pollTimer) {
+      clearInterval(this.pollTimer);
+      this.pollTimer = null;
     }
 
     console.log('[CameraTracker] Stopped');
   }
 
-  async processFrame() {
-    if (!this.isRunning || !this.video) return;
+  async pollLandmarks() {
+    if (!this.isRunning) return;
 
     try {
-      if (this.detectorMode === 'face-detector' && this.detector) {
-        const faces = await this.detector.detect(this.video);
-        this.onResults(faces || []);
-      } else {
-        this.onFallbackResults();
+      const response = await chrome.runtime.sendMessage({ type: 'GET_LANDMARK_DATA' });
+      if (!response || !response.success) return;
+
+      this.landmarks = response.landmarks;
+      this.sleepinessScore = typeof response.sleepinessScore === 'number' ? response.sleepinessScore : 0;
+      this.userState = response.cameraUserState || 'unknown';
+      this.faceDetected = response.landmarks?.facePresent || false;
+      this.faceAbsentDuration = response.faceAbsentDuration || 0;
+
+      if (this.landmarks) {
+        this.detectorMode = 'mediapipe-landmarker';
       }
-    } catch (error) {
-      console.error('[CameraTracker] Frame processing error:', error);
-      this.onFallbackResults();
-    }
 
-    if (this.isRunning) {
-      setTimeout(() => this.processFrame(), 100);
-    }
-  }
-
-  onResults(faces) {
-    const now = Date.now();
-    this.lastFrameTime = now;
-
-    this.prepareCanvas();
-
-    if (faces.length === 0) {
-      this.faceDetected = false;
-      if (!this.faceAbsentSince) this.faceAbsentSince = now;
-      this.userState = 'absent';
-      this.sleepinessScore = 0;
       this.dispatchMetrics();
-      return;
+    } catch {
+      // Extension context may be invalid during navigation
     }
-
-    this.faceDetected = true;
-    this.faceAbsentSince = null;
-
-    const box = faces[0].boundingBox;
-    this.lastFaceBox = box;
-
-    const center = {
-      x: box.x + box.width / 2,
-      y: box.y + box.height / 2
-    };
-
-    const frameW = this.canvas?.width || this.video.videoWidth || 640;
-    const frameH = this.canvas?.height || this.video.videoHeight || 480;
-    const frameDiag = Math.sqrt(frameW * frameW + frameH * frameH) || 1;
-
-    let movement = 0;
-    if (this.lastCenter) {
-      const dx = center.x - this.lastCenter.x;
-      const dy = center.y - this.lastCenter.y;
-      movement = Math.sqrt(dx * dx + dy * dy) / frameDiag;
-    }
-    this.lastCenter = center;
-
-    this.movementHistory.push(movement);
-    if (this.movementHistory.length > 120) this.movementHistory.shift();
-
-    const avgMovement = this.movementHistory.length
-      ? this.movementHistory.reduce((a, b) => a + b, 0) / this.movementHistory.length
-      : 0;
-
-    const area = box.width * box.height;
-    const areaDelta = this.calibratedArea
-      ? Math.abs(area - this.calibratedArea) / Math.max(this.calibratedArea, 1)
-      : 0;
-
-    const centerOffset = this.calibratedCenter
-      ? Math.hypot(center.x - this.calibratedCenter.x, center.y - this.calibratedCenter.y) / frameDiag
-      : 0;
-
-    const lookingAway = centerOffset > this.lookAwayThreshold;
-    const restless = avgMovement > this.motionThreshold || areaDelta > 0.35;
-
-    if (lookingAway) {
-      this.userState = 'looking_away';
-    } else if (restless) {
-      this.userState = 'bored';
-    } else {
-      this.userState = 'focused';
-    }
-
-    // Proxy score from face stability + presence (not eye-blink based)
-    let score = 100;
-    score -= Math.min(55, avgMovement * 1200);
-    score -= Math.min(35, centerOffset * 500);
-    score -= Math.min(20, areaDelta * 80);
-    if (lookingAway) score -= 15;
-
-    this.sleepinessScore = Math.max(0, Math.min(100, Math.round(score)));
-
-    this.drawFaceBox(box, this.userState);
-    this.dispatchMetrics(avgMovement, centerOffset);
-  }
-
-  onFallbackResults() {
-    const now = Date.now();
-    this.prepareCanvas();
-    this.lastFaceBox = null;
-    this.faceDetected = false;
-    if (!this.faceAbsentSince) this.faceAbsentSince = now;
-    this.userState = 'absent';
-    this.sleepinessScore = 0;
-    this.dispatchMetrics(0, 0);
-  }
-
-  prepareCanvas() {
-    if (!this.canvas || !this.ctx || !this.video) return;
-    if (this.canvas.width !== this.video.videoWidth || this.canvas.height !== this.video.videoHeight) {
-      this.canvas.width = this.video.videoWidth || 640;
-      this.canvas.height = this.video.videoHeight || 480;
-    }
-    this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
-  }
-
-  drawFaceBox(box, state) {
-    if (!this.ctx || !this.canvas) return;
-
-    const color = state === 'focused' ? '#10b981' : state === 'looking_away' ? '#f59e0b' : '#ef4444';
-    this.ctx.strokeStyle = color;
-    this.ctx.lineWidth = 2;
-    this.ctx.strokeRect(box.x, box.y, box.width, box.height);
   }
 
   calibrate(type) {
-    if (!this.lastFaceBox) {
-      console.warn('[CameraTracker] No face box available for calibration');
+    // Calibration with landmarks: store current head position as baseline
+    if (!this.landmarks || !this.landmarks.facePresent) {
+      console.warn('[CameraTracker] No landmark data for calibration');
       return {};
     }
 
-    const box = this.lastFaceBox;
-    const center = { x: box.x + box.width / 2, y: box.y + box.height / 2 };
-
     if (type === 'normal') {
-      this.calibratedCenter = center;
-      this.calibratedArea = box.width * box.height;
+      this.calibratedCenter = this.landmarks.headPosition;
+      this.calibratedArea = 1; // normalized
     } else if (type === 'smile') {
-      // No facial landmarks in FaceDetector; use this step to calibrate motion sensitivity.
       this.motionThreshold = Math.max(this.motionThreshold, 0.035);
     } else if (type === 'look_away' && this.calibratedCenter) {
-      const frameW = this.canvas?.width || this.video.videoWidth || 640;
-      const frameH = this.canvas?.height || this.video.videoHeight || 480;
-      const frameDiag = Math.sqrt(frameW * frameW + frameH * frameH) || 1;
-      const offset = Math.hypot(center.x - this.calibratedCenter.x, center.y - this.calibratedCenter.y) / frameDiag;
+      const hp = this.landmarks.headPosition;
+      const offset = Math.hypot(hp.x - this.calibratedCenter.x, hp.y - this.calibratedCenter.y);
       this.lookAwayThreshold = Math.max(0.08, offset * 0.65);
     }
 
@@ -269,12 +111,15 @@ class CameraTracker {
     if (data.lookAwayThreshold) this.lookAwayThreshold = data.lookAwayThreshold;
   }
 
-  dispatchMetrics(avgMovement = 0, centerOffset = 0) {
+  dispatchMetrics() {
+    const lm = this.landmarks || {};
+    const hp = lm.headPose || {};
+
     const event = new CustomEvent('sleepinessMetrics', {
       detail: {
-        leftEyeEAR: 0,
-        rightEyeEAR: 0,
-        avgEAR: 0,
+        leftEyeEAR: lm.leftEAR || 0,
+        rightEyeEAR: lm.rightEAR || 0,
+        avgEAR: lm.avgEAR || 0,
         blinkCount: 0,
         lastBlinkDuration: 0,
         blinkRate: 0,
@@ -282,11 +127,14 @@ class CameraTracker {
         sleepinessScore: this.sleepinessScore,
         faceDetected: this.faceDetected,
         userState: this.userState,
-        headPose: { yaw: centerOffset, pitch: 0 },
-        avgMovement,
-        faceAbsentDuration: this.faceAbsentSince ? Date.now() - this.faceAbsentSince : 0
-        ,
-        detectorMode: this.detectorMode
+        headPose: { yaw: hp.yaw || 0, pitch: hp.pitch || 0, roll: hp.roll || 0 },
+        avgMovement: 0,
+        faceAbsentDuration: this.faceAbsentDuration,
+        detectorMode: this.detectorMode,
+        eyesClosed: lm.eyesClosed || false,
+        lookingAway: lm.lookingAway || false,
+        mouthOpen: lm.mouthOpen || false,
+        blendshapes: lm.blendshapes || {}
       }
     });
 

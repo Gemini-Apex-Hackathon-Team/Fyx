@@ -86,6 +86,33 @@ function initializeTracking() {
     }
   }, 30000);
 
+  // Inactivity quiz trigger — after 10 seconds of no activity, request a quiz
+  let inactivityQuizFired = false;
+  setInterval(() => {
+    try {
+      if (!chrome.runtime?.id) return;
+      const idleMs = Date.now() - engagementData.lastActivityTime;
+      if (idleMs >= 10000 && !inactivityQuizFired && !document.hidden) {
+        inactivityQuizFired = true;
+        // Ask background to generate and send a quiz for this page
+        const pageContent = getPageContent();
+        chrome.runtime.sendMessage({
+          type: 'GEN_QUIZ',
+          content: pageContent.text,
+          title: document.title
+        }).then(response => {
+          if (response && response.quiz) {
+            showQuizOverlay(response.quiz);
+          }
+        }).catch(() => {});
+      }
+      // Reset flag once user becomes active again
+      if (idleMs < 5000) {
+        inactivityQuizFired = false;
+      }
+    } catch { /* context invalidated */ }
+  }, 2000);
+
   // Cheap local signals to background agent runtime
   signalInterval = setInterval(() => {
     try {

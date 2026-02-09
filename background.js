@@ -1091,6 +1091,12 @@ Return JSON:
 }
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  // Ignore broadcast messages that background sends to itself
+  const broadcastTypes = ['GEMINI_REASONING', 'ATTENTION_UPDATE', 'SESSION_STARTED', 'SESSION_ENDED'];
+  if (broadcastTypes.includes(message.type)) {
+    return false; // No async response needed
+  }
+
   (async () => {
     try {
       if (message.type === 'UPDATE_CONFIG') {
@@ -1099,7 +1105,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         sendResponse({ success: true });
       }
 
-      if (message.type === 'UPDATE_API_KEY') {
+      else if (message.type === 'UPDATE_API_KEY') {
         if (message.key) {
           geminiApiKey = message.key;
         } else {
@@ -1109,9 +1115,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         sendResponse({ success: true });
       }
 
-      if (message.type === 'GET_ATTENTION_SCORE') sendResponse({ score: attentionScore });
+      else if (message.type === 'GET_ATTENTION_SCORE') {
+        sendResponse({ score: attentionScore });
+      }
 
-      if (message.type === 'SIGNAL') {
+      else if (message.type === 'SIGNAL') {
         const tabId = sender?.tab?.id;
         if (!tabId) {
           sendResponse({ success: false, error: 'Missing tab id' });
@@ -1121,29 +1129,29 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         sendResponse({ success: true, ...result });
       }
 
-      if (message.type === 'QUIZ_COMPLETED') {
+      else if (message.type === 'QUIZ_COMPLETED') {
         handleQuizResult(message.correct);
         sendResponse({ success: true });
       }
 
-      if (message.type === 'REQUEST_BREAK') {
+      else if (message.type === 'REQUEST_BREAK') {
         await triggerAIIntervention('break_suggestion');
         sendResponse({ success: true });
       }
 
-      if (message.type === 'START_FOCUS_SESSION') {
+      else if (message.type === 'START_FOCUS_SESSION') {
         await startFocusSession(message.duration, message.goal || '');
         sendResponse({ success: true });
       }
 
-      if (message.type === 'UPDATE_SLEEPINESS_SCORE') {
+      else if (message.type === 'UPDATE_SLEEPINESS_SCORE') {
         sleepinessScore = message.score;
         cameraUserState = message.userState || 'unknown';
         faceAbsentDuration = message.faceAbsentDuration || 0;
         sendResponse({ success: true });
       }
 
-      if (message.type === 'CAMERA_METRICS') {
+      else if (message.type === 'CAMERA_METRICS') {
         const metrics = message.metrics || {};
         sleepinessScore = typeof metrics.sleepinessScore === 'number' ? metrics.sleepinessScore : sleepinessScore;
         cameraUserState = metrics.userState || cameraUserState || 'unknown';
@@ -1152,23 +1160,23 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         sendResponse({ success: true });
       }
 
-      if (message.type === 'CAMERA_STATUS') {
+      else if (message.type === 'CAMERA_STATUS') {
         await chrome.storage.local.set({ cameraStatus: message });
         sendResponse({ success: true });
       }
 
-      if (message.type === 'CAMERA_HEARTBEAT') {
+      else if (message.type === 'CAMERA_HEARTBEAT') {
         await chrome.storage.local.set({ cameraHeartbeat: message });
         sendResponse({ success: true });
       }
 
-      if (message.type === 'CAMERA_FRAME') {
+      else if (message.type === 'CAMERA_FRAME') {
         // Gemini Vision fallback: offscreen sends base64 camera frame
         handleCameraFrame(message.frame, message.ts);
         sendResponse({ success: true });
       }
 
-      if (message.type === 'CAMERA_SIGNAL') {
+      else if (message.type === 'CAMERA_SIGNAL') {
         await chrome.storage.local.set({ cameraSignal: message });
 
         // Store full landmark data for Gemini prompts
@@ -1218,17 +1226,17 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         sendResponse({ success: true });
       }
 
-      if (message.type === 'START_SESSION') {
+      else if (message.type === 'START_SESSION') {
         const result = await startFocusSession(message.duration, message.goal);
         sendResponse(result);
       }
 
-      if (message.type === 'STOP_SESSION') {
+      else if (message.type === 'STOP_SESSION') {
         const summary = await stopFocusSession();
         sendResponse(summary);
       }
 
-      if (message.type === 'GET_SESSION_STATE') {
+      else if (message.type === 'GET_SESSION_STATE') {
         sendResponse({
           active: focusSession.isWorking,
           startTime: focusSession.startTime,
@@ -1239,7 +1247,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         });
       }
 
-      if (message.type === 'ENABLE_CAMERA') {
+      else if (message.type === 'ENABLE_CAMERA') {
         userConfig.cameraEnabled = message.enabled;
         await chrome.storage.local.set({ userConfig });
         offscreenEnabled = !!message.enabled;
@@ -1248,13 +1256,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         sendResponse({ success: true });
       }
 
-      if (message.type === 'ANALYZE_PATTERNS') {
+      else if (message.type === 'ANALYZE_PATTERNS') {
         await analyzeUserPatterns();
         const insights = await chrome.storage.local.get('geminiInsights');
         sendResponse(insights.geminiInsights || {});
       }
 
-      if (message.type === 'GET_LANDMARK_DATA') {
+      else if (message.type === 'GET_LANDMARK_DATA') {
         sendResponse({
           success: true,
           landmarks: latestLandmarkData,
@@ -1264,7 +1272,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         });
       }
 
-      if (message.type === 'GET_DASHBOARD_DATA') {
+      else if (message.type === 'GET_DASHBOARD_DATA') {
         const dashData = await chrome.storage.local.get([
           'sessionHistory', 'dailyScores', 'dailyStats',
           'geminiInsights', 'userName', 'lastAnalysisTime', 'lastGeminiError'
@@ -1272,12 +1280,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         sendResponse(dashData);
       }
 
-      if (message.type === 'FUN_POPUP_RESPONSE') {
+      else if (message.type === 'FUN_POPUP_RESPONSE') {
         if (message.action === 'focused') updateAttentionScore(5);
         sendResponse({ success: true });
       }
 
-      if (message.type === 'INTERVENTION_DISMISSED') {
+      else if (message.type === 'INTERVENTION_DISMISSED') {
         interventionState.dismissedAt.push(Date.now());
         interventionState.dismissedAt = interventionState.dismissedAt
           .filter((ts) => Date.now() - ts < 30 * 60 * 1000);
@@ -1289,7 +1297,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         sendResponse({ success: true });
       }
 
-      if (message.type === 'RESULT') {
+      else if (message.type === 'RESULT') {
         const tabId = sender?.tab?.id;
         if (!tabId) {
           sendResponse({ success: false, error: 'Missing tab id' });
@@ -1318,12 +1326,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         sendResponse({ success: true, state: agent.state });
       }
 
-      if (message.type === 'REQUEST_QUIZ_AFTER_BLINK') {
+      else if (message.type === 'REQUEST_QUIZ_AFTER_BLINK') {
         await triggerContentQuiz();
         sendResponse({ success: true });
       }
 
-      if (message.type === 'GEN_QUIZ') {
+      else if (message.type === 'GEN_QUIZ') {
         const content = message.content || '';
         const title = message.title || 'Untitled';
 
@@ -1352,7 +1360,18 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           quiz = await generateQuiz({ text: content, title });
         }
 
+        // Log quiz generation to reasoning feed so it shows in dashboard
+        await logGeminiReasoning({
+          type: 'quiz',
+          message: `Generated quiz: "${quiz.question}"`
+        });
+
         sendResponse({ success: true, quiz });
+      }
+
+      else {
+        // Unknown message type — respond immediately to avoid holding channel open
+        sendResponse({ success: false, error: 'Unknown message type' });
       }
     } catch (error) {
       sendResponse({ success: false, error: error.message });

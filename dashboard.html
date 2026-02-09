@@ -232,6 +232,122 @@
     }
     .empty-state .empty-icon { font-size: 48px; margin-bottom: 12px; }
 
+    /* Live Session Card */
+    .live-session-card {
+      background: linear-gradient(135deg, rgba(99, 102, 241, 0.15), rgba(139, 92, 246, 0.1));
+      border: 1px solid rgba(129, 140, 248, 0.25);
+    }
+    .live-session-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 16px;
+    }
+    .live-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      background: rgba(16, 185, 129, 0.15);
+      color: #10b981;
+      padding: 4px 12px;
+      border-radius: 20px;
+      font-size: 12px;
+      font-weight: 600;
+    }
+    .live-badge .dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: #10b981;
+      animation: pulse 2s infinite;
+    }
+    .live-badge.inactive { background: rgba(255,255,255,0.08); color: rgba(255,255,255,0.4); }
+    .live-badge.inactive .dot { background: rgba(255,255,255,0.3); animation: none; }
+    .session-controls { display: flex; gap: 10px; align-items: center; }
+    .session-timer-display {
+      font-size: 36px;
+      font-weight: 800;
+      color: #a78bfa;
+      text-align: center;
+      margin: 12px 0;
+      font-variant-numeric: tabular-nums;
+    }
+    .session-goal-display {
+      text-align: center;
+      font-size: 14px;
+      color: rgba(255,255,255,0.5);
+      margin-bottom: 16px;
+    }
+    .session-btn {
+      padding: 10px 24px;
+      border-radius: 12px;
+      border: none;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+    .session-btn.start {
+      background: linear-gradient(135deg, #6366f1, #8b5cf6);
+      color: white;
+    }
+    .session-btn.start:hover { filter: brightness(1.1); }
+    .session-btn.stop {
+      background: rgba(239, 68, 68, 0.15);
+      color: #ef4444;
+      border: 1px solid rgba(239, 68, 68, 0.3);
+    }
+    .session-btn.stop:hover { background: rgba(239, 68, 68, 0.25); }
+    .session-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+    .goal-input {
+      width: 100%;
+      padding: 10px 14px;
+      border-radius: 10px;
+      border: 1px solid rgba(255,255,255,0.1);
+      background: rgba(255,255,255,0.05);
+      color: #f1f5f9;
+      font-size: 14px;
+      margin-bottom: 12px;
+    }
+    .goal-input::placeholder { color: rgba(255,255,255,0.3); }
+
+    /* Reasoning Feed */
+    .reasoning-feed {
+      margin-top: 20px;
+      border-top: 1px solid rgba(255,255,255,0.08);
+      padding-top: 16px;
+    }
+    .reasoning-feed h3 {
+      font-size: 14px;
+      color: rgba(255,255,255,0.5);
+      margin-bottom: 12px;
+    }
+    .reasoning-list {
+      list-style: none;
+      max-height: 300px;
+      overflow-y: auto;
+    }
+    .reasoning-item {
+      font-size: 13px;
+      color: rgba(255,255,255,0.6);
+      padding: 10px 12px;
+      border-radius: 10px;
+      margin-bottom: 6px;
+      background: rgba(255,255,255,0.03);
+      border-left: 3px solid #6366f1;
+      line-height: 1.5;
+    }
+    .reasoning-item .r-time {
+      color: rgba(255,255,255,0.3);
+      font-size: 11px;
+      margin-right: 8px;
+    }
+    .reasoning-item.type-intervention { border-left-color: #f59e0b; }
+    .reasoning-item.type-nudge { border-left-color: #ef4444; }
+    .reasoning-item.type-observation { border-left-color: rgba(255,255,255,0.15); }
+    .reasoning-item.type-session_start { border-left-color: #10b981; }
+    .reasoning-item.type-session_end { border-left-color: #a78bfa; }
+
     /* Two column layout */
     .two-col {
       display: grid;
@@ -256,6 +372,44 @@
         <div class="date" id="current-date"></div>
       </div>
       <button class="refresh-btn" id="refresh-insights">Refresh Insights</button>
+    </div>
+
+    <!-- Live Session -->
+    <div class="card live-session-card" id="live-session-card">
+      <div class="live-session-header">
+        <h2>Live Session</h2>
+        <div class="live-badge inactive" id="live-badge">
+          <span class="dot"></span>
+          <span id="live-badge-text">No Session</span>
+        </div>
+      </div>
+
+      <!-- Idle state: start form -->
+      <div id="session-idle">
+        <input type="text" class="goal-input" id="dash-goal" placeholder="Session goal (e.g. Finish chapter 3 notes)">
+        <div class="session-controls" style="justify-content: center;">
+          <button class="session-btn start" id="dash-start-btn">Start Focus Session</button>
+        </div>
+      </div>
+
+      <!-- Active state: timer + stop -->
+      <div id="session-active" style="display: none;">
+        <div class="session-timer-display" id="dash-timer">25:00</div>
+        <div class="session-goal-display" id="dash-goal-display"></div>
+        <div class="session-controls" style="justify-content: center;">
+          <button class="session-btn stop" id="dash-stop-btn">Stop Session</button>
+        </div>
+      </div>
+
+      <!-- Gemini Reasoning Feed -->
+      <div class="reasoning-feed">
+        <h3>AI Reasoning Feed</h3>
+        <ul class="reasoning-list" id="dash-reasoning-list">
+          <li class="reasoning-item type-observation">
+            <span class="r-time">--</span> Start a session to see AI reasoning here
+          </li>
+        </ul>
+      </div>
     </div>
 
     <!-- Stats -->

@@ -17,6 +17,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   await restoreSessionState();
   setupEventListeners();
   updateScoreDisplay();
+  initCameraPreview();
 });
 
 // Restore session state from background
@@ -321,6 +322,23 @@ function setupEventListeners() {
     });
     chrome.runtime.sendMessage({ type: 'ENABLE_CAMERA', enabled });
     setTimeout(loadCameraRuntime, 300);
+
+    // Toggle camera preview
+    const video = document.getElementById('camera-preview');
+    const overlay = document.getElementById('camera-overlay');
+    if (enabled) {
+      initCameraPreview();
+    } else {
+      if (cameraStream) {
+        cameraStream.getTracks().forEach(t => t.stop());
+        cameraStream = null;
+      }
+      if (video) video.srcObject = null;
+      if (overlay) {
+        overlay.textContent = 'Camera off';
+        overlay.classList.remove('hidden');
+      }
+    }
   });
 
   document.getElementById('open-settings')?.addEventListener('click', () => {
@@ -452,6 +470,44 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       updateSessionTimer();
       sessionTimer = setInterval(updateSessionTimer, 1000);
     }
+  }
+});
+
+// Camera preview — show user's webcam in popup
+let cameraStream = null;
+
+async function initCameraPreview() {
+  const video = document.getElementById('camera-preview');
+  const overlay = document.getElementById('camera-overlay');
+  if (!video || !overlay) return;
+
+  // Check if camera is enabled in settings
+  const config = await chrome.storage.local.get(['userConfig']);
+  const cameraEnabled = config.userConfig?.cameraEnabled;
+  if (!cameraEnabled) {
+    overlay.textContent = 'Camera off';
+    overlay.classList.remove('hidden');
+    return;
+  }
+
+  try {
+    cameraStream = await navigator.mediaDevices.getUserMedia({
+      video: { width: 320, height: 240, facingMode: 'user' },
+      audio: false
+    });
+    video.srcObject = cameraStream;
+    overlay.classList.add('hidden');
+  } catch {
+    overlay.textContent = 'Camera unavailable';
+    overlay.classList.remove('hidden');
+  }
+}
+
+// Stop camera stream when popup closes
+window.addEventListener('unload', () => {
+  if (cameraStream) {
+    cameraStream.getTracks().forEach(t => t.stop());
+    cameraStream = null;
   }
 });
 
