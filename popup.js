@@ -283,36 +283,6 @@ function setupEventListeners() {
     updateConfig({ quizFrequency: parseInt(e.target.value) });
   });
 
-  // Gemini API Key — load/save from storage, fallback to local-config.js
-  const apiKeyInput = document.getElementById('gemini-api-key');
-  const apiKeyStatus = document.getElementById('api-key-status');
-
-  chrome.storage.local.get(['geminiApiKey']).then(keyData => {
-    if (keyData.geminiApiKey) {
-      apiKeyInput.value = keyData.geminiApiKey;
-      apiKeyStatus.textContent = 'Key saved';
-      apiKeyStatus.style.color = '#10b981';
-    } else {
-      apiKeyStatus.textContent = 'Using local-config.js';
-      apiKeyStatus.style.color = 'rgba(255,255,255,0.4)';
-    }
-  });
-
-  apiKeyInput.addEventListener('change', () => {
-    const key = apiKeyInput.value.trim();
-    if (key) {
-      chrome.storage.local.set({ geminiApiKey: key });
-      chrome.runtime.sendMessage({ type: 'UPDATE_API_KEY', key }).catch(() => {});
-      apiKeyStatus.textContent = 'Key saved';
-      apiKeyStatus.style.color = '#10b981';
-    } else {
-      chrome.storage.local.remove('geminiApiKey');
-      chrome.runtime.sendMessage({ type: 'UPDATE_API_KEY', key: '' }).catch(() => {});
-      apiKeyStatus.textContent = 'Using local-config.js';
-      apiKeyStatus.style.color = 'rgba(255,255,255,0.4)';
-    }
-  });
-
   document.getElementById('enable-camera').addEventListener('change', async (e) => {
     const enabled = e.target.checked;
     await updateConfig({ cameraEnabled: enabled });
