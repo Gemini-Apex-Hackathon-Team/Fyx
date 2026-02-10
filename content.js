@@ -1,11 +1,16 @@
 // FYX Content Script
 // Tracks user engagement on pages and shows interventions
 
+console.log('[FYX Content] 🚀 FYX Content Script loading on:', window.location.href);
+
 // Guard against double-injection (manifest + scripting API)
 if (typeof window.__fyxContentLoaded !== 'undefined') {
+  console.log('[FYX Content] ⏭️ Already loaded, skipping re-execution');
   // Already loaded — skip re-execution
 } else {
 window.__fyxContentLoaded = true;
+console.log('[FYX Content] ✅ First load - initializing...');
+console.log('[FYX Content] 📰 Page Title:', document.title);
 
 let engagementData = {
   timeVisible: 0,
@@ -107,11 +112,24 @@ function initializeTracking() {
   }, 2000);
 
   // Cheap local signals to background agent runtime
+  let signalCount = 0;
   signalInterval = setInterval(() => {
     try {
       if (!chrome.runtime?.id) return; // extension context invalidated
       const idleSeconds = Math.floor((Date.now() - engagementData.lastActivityTime) / 1000);
       const interactionBursts = (engagementData.mouseMovements || 0) + (engagementData.keyPresses || 0);
+      
+      signalCount++;
+      // Log every 5th signal to avoid console spam
+      if (signalCount % 5 === 1) {
+        console.log('[FYX Content] 📡 Sending signal to background:', {
+          idleSeconds,
+          visible: !document.hidden,
+          faceDetected: latestCameraState.faceDetected,
+          tabSwitches: recentTabSwitches
+        });
+      }
+      
       chrome.runtime.sendMessage({
         type: 'SIGNAL',
         payload: {
@@ -154,6 +172,8 @@ function initializeTracking() {
 
 // Get page content for quiz generation and Gemini context
 function getPageContent() {
+  console.log('[FYX Content] 📄 Grabbing page content for Gemini analysis...');
+  
   const article = document.querySelector('article') ||
     document.querySelector('main') ||
     document.querySelector('.content') ||
@@ -161,6 +181,9 @@ function getPageContent() {
     document.body;
 
   const text = article.innerText || article.textContent || '';
+  console.log(`[FYX Content] 📰 Page Title: "${document.title}"`);
+  console.log(`[FYX Content] 📝 Content length: ${text.length} chars (sending first 2000)`);
+  console.log(`[FYX Content] 🔍 Content preview: "${text.substring(0, 150)}..."`)
 
   // Detect content type
   let contentType = 'webpage';
@@ -189,7 +212,7 @@ function getPageContent() {
     }
   }
 
-  return {
+  const result = {
     text: text.substring(0, 2000),
     contentType: contentType,
     scrollPosition: engagementData.scrollPosition,
@@ -199,6 +222,15 @@ function getPageContent() {
     mouseActivity: engagementData.mouseMovements,
     isIdle: (Date.now() - engagementData.lastActivityTime) > 60000
   };
+  
+  console.log(`[FYX Content] ✅ Content grabbed:`, {
+    contentType: result.contentType,
+    scrollProgress: result.scrollProgress + '%',
+    timeOnPage: result.timeOnPage + 's',
+    isIdle: result.isIdle
+  });
+  
+  return result;
 }
 
 // Message listener

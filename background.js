@@ -1,6 +1,8 @@
 // FYX Background Service Worker
 // Handles attention tracking, Gemini agent decisions, and interventions
 
+console.log('[FYX Background] 🚀 FYX Background Service Worker starting...');
+
 importScripts('intervention-manager.js');
 importScripts('enhanced-intervention.js');
 importScripts('gemini-session-manager.js');
@@ -10,6 +12,9 @@ importScripts('local-config.js');
 const GEMINI_MODEL = 'gemini-2.5-flash';
 const GEMINI_API_URL = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
 let geminiApiKey = (self.FYX_LOCAL_CONFIG && self.FYX_LOCAL_CONFIG.GEMINI_API_KEY) || '';
+
+console.log('[FYX Background] 🔑 Gemini API Key loaded:', geminiApiKey ? `${geminiApiKey.substring(0, 10)}...` : '❌ MISSING!');
+console.log('[FYX Background] 🌐 Gemini API URL:', GEMINI_API_URL);
 
 let geminiSession = null;
 let currentTab = null;
@@ -71,7 +76,7 @@ let tabActivity = {
 };
 
 let interventionState = {
-  cooldownMs: 8 * 60 * 1000,
+  cooldownMs: 1 * 60 * 1000, // 1 minute for testing (was 8 min)
   dismissedAt: [],
   sensitivityBackoffUntil: 0
 };
@@ -183,44 +188,114 @@ function deriveState(score) {
 }
 
 async function callDecideWorker(payload) {
-  const res = await fetch('https://focus-quiz-api.amaasabea09.workers.dev/decide', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload)
+  console.log('[FYX Background] 🧠 GEMINI ANALYZING USER ALERTNESS...');
+  console.log('[FYX Background] 📊 User State:', {
+    distractionScore: payload.score + '/10',
+    state: payload.state,
+    idleSeconds: payload.signal?.idleSeconds || 0,
+    tabVisible: payload.signal?.visible !== false,
+    faceDetected: payload.signal?.faceDetected,
+    cameraState: payload.signal?.cameraUserState || 'unknown'
   });
-  if (!res.ok) {
-    throw new Error(`Decide worker HTTP ${res.status}`);
+  console.log('[FYX Background] 📄 Page Context:', {
+    title: payload.context?.title || 'Unknown',
+    snippetLength: (payload.context?.snippet || '').length
+  });
+  
+  // Use Gemini to decide intervention instead of external worker
+  const prompt = `You are FYX, an AI focus assistant. Analyze the user's state and decide on an intervention.
+
+**Current State:**
+- Distraction Score: ${payload.score}/10
+- State: ${payload.state}
+- Idle for: ${payload.signal?.idleSeconds || 0} seconds
+- Tab visible: ${payload.signal?.visible !== false}
+- Tab switches recently: ${payload.signal?.tabSwitchesLastMinute || 0}
+- Face detected: ${payload.signal?.faceDetected}
+- Camera state: ${payload.signal?.cameraUserState || 'unknown'}
+
+**Page Context:**
+- Title: ${payload.context?.title || 'Unknown'}
+- Content snippet: "${(payload.context?.snippet || '').substring(0, 200)}"
+
+**Recent Interventions:** ${payload.recentInterventions?.length || 0} in history
+
+DECIDE what action to take:
+- "generate_quiz": If user is reading content and needs a comprehension check
+- "suggest_break": If user seems fatigued or has been working long
+- "show_nudge": For a simple reminder to refocus
+
+Return ONLY valid JSON:
+{
+  "tool": "generate_quiz" | "suggest_break" | "show_nudge",
+  "message": "A brief, friendly message to show the user",
+  "reason": "Why you chose this intervention"
+}`;
+
+  try {
+    const response = await callGeminiAPI(prompt);
+    console.log('[FYX Background] 📥 Gemini decision response:', response);
+    
+    const jsonMatch = response.match(/\{[\s\S]*\}/);
+    if (jsonMatch) {
+      const decision = JSON.parse(jsonMatch[0]);
+      console.log('[FYX Background] ✅ GEMINI DECISION:', decision);
+      console.log('[FYX Background] 🎯 Action:', decision.tool);
+      console.log('[FYX Background] 💬 Message:', decision.message);
+      console.log('[FYX Background] 📝 Reason:', decision.reason);
+      return decision;
+    }
+    console.warn('[FYX Background] ⚠️ Failed to parse decision from Gemini');
+  } catch (error) {
+    console.error('[FYX Background] ❌ Gemini decide error:', error);
   }
-  return res.json();
+  
+  // Fallback if Gemini fails
+  console.log('[FYX Background] ⚠️ Using fallback decision');
+  return { tool: 'generate_quiz', message: 'Quick focus check!', reason: 'fallback' };
 }
 
 async function handleAgentSignal(tabId, signal) {
   const agent = getTabAgent(tabId);
   const now = Date.now();
 
+  console.log('[FYX Background] 📡 AGENT SIGNAL RECEIVED for tab', tabId);
+  console.log('[FYX Background] 📊 Signal data:', {
+    idleSeconds: signal.idleSeconds || 0,
+    visible: signal.visible,
+    faceDetected: signal.faceDetected,
+    contentHint: signal.contentHint?.substring(0, 50) + '...'
+  });
+
   if ((signal.idleSeconds || 0) < 8) {
     agent.lastActivityAt = now;
   }
 
   agent.distractionScore = scoreFromSignal(signal);
+  console.log('[FYX Background] 🎯 Distraction score:', agent.distractionScore + '/10');
 
   if (agent.interventionCooldownUntil > now) {
     agent.state = AGENT_STATES.COOLDOWN;
+    console.log('[FYX Background] ⏸️ In cooldown, skipping intervention');
     return { state: agent.state, score: agent.distractionScore };
   }
 
   const nextState = deriveState(agent.distractionScore);
   agent.state = nextState;
+  console.log('[FYX Background] 📌 User state:', nextState);
 
   if (nextState === AGENT_STATES.FOCUSED) {
+    console.log('[FYX Background] ✅ User is FOCUSED - no intervention needed');
     return { state: agent.state, score: agent.distractionScore };
   }
 
   if (agent.interventionInProgress) {
+    console.log('[FYX Background] ⏳ Intervention already in progress');
     return { state: AGENT_STATES.INTERVENING, score: agent.distractionScore };
   }
 
   if (nextState === AGENT_STATES.DRIFTING) {
+    console.log('[FYX Background] ⚠️ User is DRIFTING - sending gentle nudge');
     await chrome.tabs.sendMessage(tabId, {
       type: 'INTERVENTION',
       action: 'SHOW_NUDGE',
@@ -231,16 +306,24 @@ async function handleAgentSignal(tabId, signal) {
     }).catch(() => {});
 
     agent.lastInterventionAt = now;
-    agent.interventionCooldownUntil = now + (2 * 60 * 1000);
+    agent.interventionCooldownUntil = now + (1 * 60 * 1000); // 1 min for testing (was 2 min)
     pushInterventionHistory(agent, { kind: 'nudge', score: agent.distractionScore });
     return { state: AGENT_STATES.COOLDOWN, score: agent.distractionScore };
   }
 
   // DISTRACTED path: gather context and ask decide worker
+  console.log('[FYX Background] 🚨 User is DISTRACTED - initiating intervention!');
   agent.interventionInProgress = true;
   agent.state = AGENT_STATES.INTERVENING;
   try {
+    console.log('[FYX Background] 📄 Fetching page context from content script...');
     const context = await chrome.tabs.sendMessage(tabId, { type: 'GET_CONTEXT' }).catch(() => ({}));
+    console.log('[FYX Background] 📋 Context received:', {
+      title: context.title,
+      url: context.url,
+      snippetLength: (context.snippet || '').length
+    });
+    
     const decidePayload = {
       signal,
       score: agent.distractionScore,
@@ -251,21 +334,20 @@ async function handleAgentSignal(tabId, signal) {
 
     let decision;
     try {
+      console.log('[FYX Background] 🤖 Asking Gemini to decide intervention...');
       decision = await callDecideWorker(decidePayload);
     } catch {
+      console.warn('[FYX Background] ⚠️ Decision failed, using fallback quiz');
       decision = { action: 'START_QUIZ', reason: 'fallback', tool: 'generate_quiz' };
     }
 
     if (decision.tool === 'generate_quiz') {
-      const quizRes = await fetch('https://focus-quiz-api.amaasabea09.workers.dev', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          content: context.snippet || signal.contentHint || '',
-          title: context.title || 'Current Page'
-        })
-      });
-      const quiz = quizRes.ok ? await quizRes.json() : null;
+      console.log('[FYX Background] 📝 Generating quiz for user...');
+      const quiz = await generateQuizWithGemini(
+        context.snippet || signal.contentHint || '',
+        context.title || 'Current Page'
+      );
+      console.log('[FYX Background] 📤 Sending quiz to content script...');
       await chrome.tabs.sendMessage(tabId, {
         type: 'INTERVENTION',
         action: 'START_QUIZ',
@@ -299,7 +381,7 @@ async function handleAgentSignal(tabId, signal) {
     }
 
     agent.lastInterventionAt = now;
-    agent.interventionCooldownUntil = now + (8 * 60 * 1000);
+    agent.interventionCooldownUntil = now + (1 * 60 * 1000); // 1 min for testing (was 8 min)
     agent.state = AGENT_STATES.COOLDOWN;
     agent.interventionInProgress = false;
   } finally {
@@ -849,12 +931,19 @@ If type is quiz, include quiz. If type is quiz_game or break_tab, include challe
 }
 
 async function callGeminiAPI(prompt) {
+  console.log('[FYX Background] 🤖 GEMINI API CALL STARTING...');
+  console.log('[FYX Background] 📤 Prompt preview:', prompt.substring(0, 300) + '...');
+  
   if (!geminiApiKey || geminiApiKey === 'PASTE_NEW_GEMINI_KEY_HERE') {
+    console.error('[FYX Background] ❌ Gemini API key missing! Check local-config.js');
     await chrome.storage.local.set({ lastGeminiError: 'Gemini key missing in local-config.js' });
     return 'Gemini key is not configured. Set GEMINI_API_KEY in local-config.js.';
   }
+  
+  console.log('[FYX Background] 🔑 API Key present:', geminiApiKey.substring(0, 10) + '...');
 
   try {
+    console.log('[FYX Background] 🌐 Sending request to Gemini...');
     const response = await fetch(`${GEMINI_API_URL}?key=${geminiApiKey}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -868,28 +957,95 @@ async function callGeminiAPI(prompt) {
       })
     });
 
+    console.log('[FYX Background] 📥 Gemini response status:', response.status, response.ok ? '✅' : '❌');
+    
     if (!response.ok) {
+      console.error('[FYX Background] ❌ Gemini HTTP error:', response.status);
       await chrome.storage.local.set({ lastGeminiError: `Gemini HTTP ${response.status}` });
       return 'Take a brief reset and refocus on the main idea.';
     }
 
     const data = await response.json();
+    console.log('[FYX Background] 📊 Gemini response received:', JSON.stringify(data).substring(0, 500));
     await chrome.storage.local.set({ lastGeminiError: '' });
 
     if (data.candidates && data.candidates[0]) {
-      return data.candidates[0].content.parts[0].text;
+      const result = data.candidates[0].content.parts[0].text;
+      console.log('[FYX Background] ✅ GEMINI RESPONSE:', result);
+      return result;
     }
 
     if (data.error) {
+      console.error('[FYX Background] ❌ Gemini API error:', data.error);
       await chrome.storage.local.set({ lastGeminiError: data.error.message || 'Gemini API error' });
       return 'Take a brief reset and refocus on the main idea.';
     }
 
+    console.warn('[FYX Background] ⚠️ Gemini returned unexpected format');
     return 'Take a brief reset and refocus on the main idea.';
   } catch (error) {
+    console.error('[FYX Background] ❌ Gemini request failed:', error);
     await chrome.storage.local.set({ lastGeminiError: error.message || 'Gemini request failed' });
     return 'Take a brief reset and refocus on the main idea.';
   }
+}
+
+// --- Generate quiz using Gemini API ---
+async function generateQuizWithGemini(content, title) {
+  console.log('[FYX Background] 📝 GENERATING QUIZ WITH GEMINI...');
+  console.log(`[FYX Background] 📰 Quiz for page: "${title}"`);
+  console.log(`[FYX Background] 📄 Content length: ${(content || '').length} chars`);
+  console.log(`[FYX Background] 🔍 Content preview: "${(content || '').substring(0, 200)}..."`);
+  
+  const prompt = `You are FYX, an AI focus assistant. Generate a simple comprehension quiz question about this content.
+
+**Page Title:** ${title}
+**Content Excerpt:** "${(content || '').substring(0, 800)}"
+
+Create ONE multiple-choice question that tests whether the user has been paying attention to this content.
+The question should be:
+- Simple and quick to answer (5-10 seconds)
+- Related to the main topic or a key detail
+- Not too difficult - just checking basic comprehension
+
+Return ONLY valid JSON:
+{
+  "question": "Your question here?",
+  "options": ["Option A", "Option B", "Option C"],
+  "correctIndex": 0,
+  "explanation": "Brief explanation of why this is correct"
+}
+
+If the content is too short or unclear, create a general focus question like "What was the main topic you were reading about?"`;
+
+  try {
+    const response = await callGeminiAPI(prompt);
+    console.log('[FYX Background] 📊 Quiz response from Gemini:', response);
+    
+    const jsonMatch = response.match(/\{[\s\S]*\}/);
+    if (jsonMatch) {
+      const quiz = JSON.parse(jsonMatch[0]);
+      // Validate quiz structure
+      if (quiz.question && Array.isArray(quiz.options) && quiz.options.length >= 2) {
+        console.log('[FYX Background] ✅ QUIZ GENERATED SUCCESSFULLY!');
+        console.log('[FYX Background] ❓ Question:', quiz.question);
+        console.log('[FYX Background] 📋 Options:', quiz.options);
+        return quiz;
+      }
+    }
+    console.warn('[FYX Background] ⚠️ Failed to parse quiz from Gemini response');
+  } catch (error) {
+    console.error('[FYX Background] ❌ Gemini quiz generation error:', error);
+  }
+
+  // Fallback quiz if Gemini fails
+  console.log('[FYX Background] ⚠️ Using fallback quiz');
+  return {
+    question: `What was the main topic of "${title}"?`,
+    options: ['I remember the content', 'I was getting distracted', 'I need to re-read'],
+    correctIndex: 0,
+    explanation: 'Staying focused helps you retain information better!'
+  };
 }
 
 // --- Gemini Vision API for face analysis from camera frames ---
@@ -1323,9 +1479,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         });
 
         if (dismissed) {
-          agent.interventionCooldownUntil = now + (6 * 60 * 1000);
+          agent.interventionCooldownUntil = now + (1 * 60 * 1000); // 1 min for testing (was 6 min)
         } else {
-          agent.interventionCooldownUntil = now + (9 * 60 * 1000);
+          agent.interventionCooldownUntil = now + (1 * 60 * 1000); // 1 min for testing (was 9 min)
         }
         agent.interventionInProgress = false;
         agent.state = AGENT_STATES.COOLDOWN;
@@ -1360,30 +1516,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         const content = message.content || '';
         const title = message.title || 'Untitled';
 
-        let quiz = null;
-
-        // Try external worker first
-        try {
-          const workerResponse = await fetch('https://focus-quiz-api.amaasabea09.workers.dev', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ content, title })
-          });
-
-          if (workerResponse.ok) {
-            const quizJson = await workerResponse.json();
-            if (quizJson && Array.isArray(quizJson.options) && quizJson.options.length > 0) {
-              quiz = quizJson;
-            }
-          }
-        } catch {
-          // Worker failed, fall through to Gemini
-        }
-
-        // Fallback: generate quiz via Gemini using page content
-        if (!quiz) {
-          quiz = await generateQuiz({ text: content, title });
-        }
+        // Generate quiz via Gemini
+        let quiz = await generateQuizWithGemini(content, title);
 
         // Log quiz generation to reasoning feed so it shows in dashboard
         await logGeminiReasoning({

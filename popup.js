@@ -9,6 +9,7 @@ let sessionDuration = 25 * 60; // 25 minutes in seconds
 // Initialize popup
 document.addEventListener('DOMContentLoaded', async () => {
   await loadUserGreeting();
+  await loadFocusTarget();
   await loadAttentionScore();
   await loadStatistics();
   await loadSettings();
@@ -35,7 +36,11 @@ async function restoreSessionState() {
       document.getElementById('score-section').style.display = '';
 
       if (state.goal) {
-        document.getElementById('session-goal-label').textContent = state.goal;
+        const goalLabel = document.getElementById('session-goal-label');
+        if (goalLabel) {
+          goalLabel.textContent = `Focusing: ${state.goal}`;
+          goalLabel.title = state.goal;
+        }
       }
 
       // Start timer display
@@ -61,6 +66,79 @@ async function loadUserGreeting() {
     else if (hour < 17) timeGreeting = 'Good afternoon';
     else timeGreeting = 'Good evening';
     greetingEl.textContent = `${timeGreeting}, ${data.userName}!`;
+  }
+}
+
+// Load current focus target (active tab)
+async function loadFocusTarget() {
+  const focusTargetEl = document.getElementById('focus-target');
+  const titleEl = document.getElementById('focus-target-title');
+  const urlEl = document.getElementById('focus-target-url');
+  
+  if (!focusTargetEl || !titleEl || !urlEl) return;
+  
+  try {
+    // Get the active tab
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    
+    if (tab) {
+      console.log('[FYX Popup] 📍 Current tab:', tab.title, tab.url);
+      
+      // Set title (truncate if too long)
+      const title = tab.title || 'Unknown Page';
+      titleEl.textContent = title;
+      titleEl.title = title; // Tooltip for full title
+      
+      // Set URL (show hostname only)
+      try {
+        const url = new URL(tab.url);
+        urlEl.textContent = url.hostname;
+        urlEl.title = tab.url; // Tooltip for full URL
+      } catch {
+        urlEl.textContent = tab.url || '';
+      }
+      
+      // Detect content type and add appropriate class
+      focusTargetEl.classList.remove('content-article', 'content-video', 'content-documentation');
+      
+      if (tab.url?.includes('youtube.com') || tab.url?.includes('vimeo.com')) {
+        focusTargetEl.classList.add('content-video');
+        document.querySelector('.focus-target-label').textContent = '🎬 Watching';
+      } else if (tab.url?.includes('docs.') || tab.url?.includes('developer.') || tab.url?.includes('readme') || tab.url?.includes('github.com')) {
+        focusTargetEl.classList.add('content-documentation');
+        document.querySelector('.focus-target-label').textContent = '📚 Studying';
+      } else {
+        focusTargetEl.classList.add('content-article');
+        document.querySelector('.focus-target-label').textContent = '📍 Focusing On';
+      }
+      
+      // Try to get more context from content script
+      try {
+        const response = await chrome.tabs.sendMessage(tab.id, { type: 'GET_CONTEXT' });
+        if (response?.contentType) {
+          if (response.contentType === 'video') {
+            focusTargetEl.classList.remove('content-article', 'content-documentation');
+            focusTargetEl.classList.add('content-video');
+            document.querySelector('.focus-target-label').textContent = '🎬 Watching';
+          } else if (response.contentType === 'documentation') {
+            focusTargetEl.classList.remove('content-article', 'content-video');
+            focusTargetEl.classList.add('content-documentation');
+            document.querySelector('.focus-target-label').textContent = '📚 Studying';
+          } else if (response.contentType === 'article') {
+            document.querySelector('.focus-target-label').textContent = '📰 Reading';
+          }
+        }
+      } catch {
+        // Content script not available on this page
+      }
+    } else {
+      titleEl.textContent = 'No active tab';
+      urlEl.textContent = '';
+    }
+  } catch (error) {
+    console.error('[FYX Popup] Error loading focus target:', error);
+    titleEl.textContent = 'Unable to detect';
+    urlEl.textContent = '';
   }
 }
 
@@ -324,13 +402,33 @@ function setupEventListeners() {
 }
 
 // Start focus session
-function startFocusSession() {
+async function startFocusSession() {
   sessionActive = true;
   sessionStartTime = Date.now();
+
+  // Get the active tab's title as the session goal
+  let sessionGoal = 'Focus Session';
+  try {
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (tab && tab.title) {
+      // Truncate long titles
+      sessionGoal = tab.title.length > 50 ? tab.title.substring(0, 50) + '...' : tab.title;
+      console.log('[FYX Popup] 🎯 Starting session focused on:', sessionGoal);
+    }
+  } catch (error) {
+    console.error('[FYX Popup] Error getting tab title:', error);
+  }
 
   document.querySelector('.fyx-quick-actions').style.display = 'none';
   document.getElementById('session-info').style.display = 'block';
   document.getElementById('score-section').style.display = '';
+  
+  // Update the session goal label to show what we're focusing on
+  const goalLabel = document.getElementById('session-goal-label');
+  if (goalLabel) {
+    goalLabel.textContent = `Focusing: ${sessionGoal}`;
+    goalLabel.title = sessionGoal; // Full title on hover
+  }
 
   updateSessionTimer();
   sessionTimer = setInterval(updateSessionTimer, 1000);
@@ -341,7 +439,8 @@ function startFocusSession() {
 
   chrome.runtime.sendMessage({
     type: 'START_FOCUS_SESSION',
-    duration: sessionDuration / 60
+    duration: sessionDuration / 60,
+    goal: sessionGoal
   });
 
   updateStatistic('sessions', 1);
